@@ -1,4 +1,5 @@
 #include "fast/renderer/shaderc_compiler.h"
+#include "fast/renderer/builtin_pass_binaries.h"
 #if defined(_WIN32) && !defined(SHADERC_SHAREDLIB)
 // The Windows backend links shaderc_shared. Without dllimport, taking a
 // function address identifies an EXE import thunk, incorrectly binding the
@@ -8,6 +9,9 @@
 #include <shaderc/shaderc.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <array>
 #include <cctype>
 #include <fstream>
@@ -118,6 +122,28 @@ std::string IdentifyCompiler() {
 }
 }
 
+namespace {
+std::atomic<uint64_t> gShadercCalls{0};
+std::atomic<uint64_t> gShadercNanoseconds{0};
+
+// Counts one compiler call, whatever cache or catalogue sits in front of it.
+class ShadercAuditScope {
+  public:
+    ShadercAuditScope() : mStart(std::chrono::steady_clock::now()) { ++gShadercCalls; }
+    ~ShadercAuditScope() {
+        gShadercNanoseconds += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - mStart).count());
+    }
+
+  private:
+    std::chrono::steady_clock::time_point mStart;
+};
+}
+
+ShadercAudit ShadercCompilationAudit() {
+    return {gShadercCalls.load(), gShadercNanoseconds.load()};
+}
+
 const std::string& ShadercCompilerContract() {
     static const std::string contract = [] {
         try { return IdentifyCompiler(); }
@@ -134,6 +160,7 @@ std::vector<uint32_t> CompileShadercSpirv(std::string_view source, SpirvStage st
         case SpirvStage::Compute: kind = shaderc_compute_shader; break;
         default: throw std::invalid_argument("unsupported shader stage");
     }
+    const ShadercAuditScope audit;
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
@@ -147,14 +174,46 @@ std::vector<uint32_t> CompileShadercSpirv(std::string_view source, SpirvStage st
 void CachedPassShaderCompiler::Configure(std::filesystem::path directory) {
     mDirectory = std::move(directory);
     mVariants.clear();
+    mBuiltinArtifactHits = 0;
+    mTitleArtifactHits = 0;
+}
+
+std::span<const uint32_t> FindBuiltinPassShaderSpirv(std::string_view source,
+    SpirvStage stage, const ShaderDefines& defines, uint32_t vulkanMinor) {
+    return FindPassShaderArtifact(BuiltinPassArtifacts(), source, stage, defines, vulkanMinor);
 }
 
 bool CachedPassShaderCompiler::Enabled() const {
     return !mDirectory.empty() && !ShadercCompilerContract().empty();
 }
 
+void CachedPassShaderCompiler::AddArtifacts(std::span<const PassShaderArtifact> artifacts) {
+    if (artifacts.empty()) return;
+    for (const auto& [data, size] : mArtifacts)
+        if (data == artifacts.data()) return;
+    mArtifacts.emplace_back(artifacts.data(), artifacts.size());
+}
+
 std::vector<uint32_t> CachedPassShaderCompiler::Resolve(
     std::string_view source, SpirvStage stage, const char* name, const ShaderDefines& defines) {
+    auto artifact = FindBuiltinPassShaderSpirv(source, stage, defines);
+    for (const auto& [data, size] : mArtifacts) {
+        if (!artifact.empty()) break;
+        artifact = FindPassShaderArtifact(std::span(data, size), source, stage, defines);
+    }
+    if (!artifact.empty()) {
+        ++mBuiltinArtifactHits;
+        return {artifact.begin(), artifact.end()};
+    }
+    if (mTitleArtifacts && defines.empty()) {
+        if (const auto title = mTitleArtifacts(source, stage); !title.empty()) {
+            ++mTitleArtifactHits;
+            return {title.begin(), title.end()};
+        }
+    }
+    // A fixed pass absent from the built-in catalogue (resolved once per pipeline).
+    std::fprintf(stderr, "TRIAEVUM_PASS_ARTIFACT_MISS name=%s stage=%d defines=%zu\n",
+                 name != nullptr ? name : "", static_cast<int>(stage), defines.size());
     std::string variant = "/pass-vulkan1.2/performance/main/v1";
     for (const auto& [key, value] : defines)
         variant += "/" + std::to_string(key.size()) + ":" + key +
@@ -172,6 +231,7 @@ std::vector<uint32_t> CachedPassShaderCompiler::Resolve(
             case SpirvStage::Compute: kind = shaderc_compute_shader; break;
             default: throw std::invalid_argument("unsupported pass shader stage");
         }
+        const ShadercAuditScope audit;
         shaderc::Compiler compiler;
         shaderc::CompileOptions options;
         options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);

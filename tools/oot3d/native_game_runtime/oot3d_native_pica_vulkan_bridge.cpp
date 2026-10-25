@@ -1,4 +1,6 @@
 #include "oot3d_native_pica_vulkan_bridge.h"
+#include "oot3d_native_vertex_binaries.h"
+#include "oot3d_static_shadow_actor_catalog.h"
 
 #include "fast/oot3d/pica_uniform_layout.h"
 
@@ -8,6 +10,12 @@
 #include <cstring>
 
 namespace Oot3dNativeGame {
+std::span<const Fast::Renderer3ds::PicaVertexArtifact> NativePicaVertexProgramFamily() {
+    return TitleVertexArtifacts();
+}
+std::span<const Fast::Renderer::PassShaderArtifact> NativePicaTitlePassPrograms() {
+    return TitlePassArtifacts();
+}
 namespace {
 
 template <typename Destination, typename Source>
@@ -134,17 +142,29 @@ PackFragmentUniforms(
         bytes.data() +
             Fast::Oot3d::kPicaPackedFragmentShadowBiasLinearOffset,
         &uniforms.ShadowBiasLinear, sizeof(uniforms.ShadowBiasLinear));
+    static_assert(sizeof(uniforms.TevProgram) == 112U);
+    std::memcpy(bytes.data() + Fast::Oot3d::kPicaPackedFragmentTevProgramOffset,
+                &uniforms.TevProgram, sizeof(uniforms.TevProgram));
+    static_assert(sizeof(uniforms.LightingProgram) == 256U);
+    std::memcpy(bytes.data() + Fast::Oot3d::kPicaPackedFragmentLightingProgramOffset,
+                &uniforms.LightingProgram, sizeof(uniforms.LightingProgram));
+    std::memcpy(bytes.data() + Fast::Oot3d::kPicaPackedFragmentControlOffset,
+                uniforms.FragmentControl.data(), sizeof(uniforms.FragmentControl));
+    std::memcpy(bytes.data() + Fast::Oot3d::kPicaPackedFragmentProcTexOffset,
+                &uniforms.ProcTexProgram, sizeof(uniforms.ProcTexProgram));
     return bytes;
 }
 
-} // namespace
-
-bool SubmitOot3dPicaVulkanDrawPlan(
-    Oot3d::Renderer::PicaRenderBackend& renderingApi,
+// Builds the backend view of a plan and hands it to `consume`; the view and
+// the packed state it references live only for that call. A view without
+// fragment state carries no fragment uniforms or textures.
+template <typename Consume>
+bool WithOot3dPicaVulkanDrawView(
     const Oot3dPicaVulkanDrawPlan& plan, std::string* error,
     uint64_t renderTargetNamespace,
     const Oot3dPicaVulkanDrawOverrides* overrides,
-    Oot3dPicaVulkanDrawBridgeTiming* timing) {
+    Oot3dPicaVulkanDrawBridgeTiming* timing, bool fragmentState,
+    Consume&& consume) {
     using Clock = std::chrono::steady_clock;
     auto phaseStart =
         timing != nullptr ? Clock::now() : Clock::time_point{};
@@ -162,8 +182,9 @@ bool SubmitOot3dPicaVulkanDrawPlan(
                                          ? *overrides->BlendConstantColor
                                          : plan.State.OutputMerger.Blend.ConstantColor;
     const auto vertexUniforms = PackVertexUniforms(vertexUniformState, plan.State.Framebuffer.Flipped);
-    const auto fragmentUniforms =
-        PackFragmentUniforms(fragmentUniformState, viewport);
+    const auto fragmentUniforms = fragmentState
+        ? PackFragmentUniforms(fragmentUniformState, viewport)
+        : std::array<uint8_t, Fast::Oot3d::kPicaPackedFragmentUniformSize>{};
     if (timing != nullptr) {
         const auto now = Clock::now();
         timing->UniformPackingSeconds +=
@@ -208,6 +229,7 @@ bool SubmitOot3dPicaVulkanDrawPlan(
     }
     size_t textureCount = 0;
     for (const auto& texture : plan.Textures) {
+        if (!fragmentState) break;
         textures[textureCount++] = {
             texture.Slot, texture.State.Width, texture.State.Height,
             texture.State.Format, texture.State.Type, texture.State.WrapS,
@@ -218,7 +240,8 @@ bool SubmitOot3dPicaVulkanDrawPlan(
             texture.ResolvedNativeBytes(), texture.NativeContentHash,
             texture.NativeContentHashAvailable,
             texture.NativeBaseLevelContentHash,
-            texture.NativeBaseLevelContentHashAvailable};
+            texture.NativeBaseLevelContentHashAvailable,
+            texture.CopyReferences};
     }
 
     Oot3d::Renderer::PicaDrawView draw;
@@ -236,7 +259,17 @@ bool SubmitOot3dPicaVulkanDrawPlan(
             plan.Composition.Provenance),
         plan.Composition.SourcePc,
         plan.Composition.NativeValue,
+        plan.Composition.NativeProjectedShadow,
+        plan.Composition.NativeActorGeometry,
+        plan.Composition.NativeActorIdentity,
+        plan.Composition.IsolatedLighting,
+        plan.Composition.TemporalIdentity,
+        Oot3dNativeGame::StaticShadowCacheEligibleActor(
+            plan.Composition.NativeActorGeometry,
+            plan.Composition.NativeActorIdentity),
     };
+    draw.LightBinding = overrides != nullptr && overrides->LightBinding != nullptr
+        ? *overrides->LightBinding : plan.LightBinding;
     draw.CanonicalDescriptorSchemaVersion =
         plan.CanonicalIdentity.SchemaVersion;
     draw.CanonicalVertexProgramId =
@@ -253,6 +286,9 @@ bool SubmitOot3dPicaVulkanDrawPlan(
     draw.VertexShaderSource = plan.ResolvedVertexShaderSource();
     draw.FragmentShaderSource = plan.ResolvedFragmentShaderSource();
     draw.VertexShaderSourceIdentity = plan.VertexShader.SourceIdentity;
+    // Immutable title-owned family: the backend selects the effective program
+    // after applying typed instrumentation, never by a scene/material identity.
+    draw.VertexArtifacts = TitleVertexArtifacts();
     draw.FragmentShaderSourceIdentity =
         plan.FragmentShader.SourceIdentity;
     if (plan.VertexShader.TemporalProgram != nullptr) {
@@ -263,6 +299,13 @@ bool SubmitOot3dPicaVulkanDrawPlan(
         };
     }
     draw.FragmentShaderHooks = plan.FragmentShader.Hooks;
+    if (plan.SharedUberFragmentShaderSource != nullptr) {
+        draw.UberFragmentShaderKey = plan.UberFragmentShader.StateKey;
+        draw.UberFragmentShaderSource = *plan.SharedUberFragmentShaderSource;
+        draw.UberFragmentShaderSourceIdentity =
+            plan.UberFragmentShader.SourceIdentity;
+        draw.UberFragmentShaderHooks = plan.UberFragmentShader.Hooks;
+    }
     draw.FragmentFeatures.SurfaceColorResponse = plan.FragmentFeatures.SurfaceColorResponse;
     draw.FragmentFeatures.SchemaVersion =
         plan.FragmentFeatures.FragmentLighting.Available()
@@ -277,7 +320,7 @@ bool SubmitOot3dPicaVulkanDrawPlan(
     draw.FragmentFeatures.FragmentLighting =
         plan.FragmentFeatures.FragmentLighting;
     draw.VertexUniformBytes = vertexUniforms;
-    draw.FragmentUniformBytes = fragmentUniforms;
+    if (fragmentState) draw.FragmentUniformBytes = fragmentUniforms;
     draw.VertexBindings =
         std::span<const Oot3d::Renderer::PicaVertexBindingView>(
         bindings.data(), bindingCount);
@@ -358,6 +401,11 @@ bool SubmitOot3dPicaVulkanDrawPlan(
         plan.State.OutputMerger.Blend.DestinationAlpha);
     std::copy(blendConstantColor.begin(), blendConstantColor.end(),
               draw.Blend.ConstantColor);
+    const auto alphaTest = DecodeOot3dPicaAlphaTest(fragmentUniformState.FragmentControl[1]);
+    draw.AlphaTestEnabled = alphaTest.Enabled;
+    draw.AlphaCompare =
+        SameValueEnum<Oot3d::Renderer::PicaCompareFunction>(alphaTest.Compare);
+    draw.AlphaReference = alphaTest.Reference;
     draw.DepthTestEnabled = plan.State.OutputMerger.Depth.TestEnabled;
     draw.DepthWriteEnabled = plan.State.OutputMerger.Depth.WriteEnabled;
     draw.DepthCompare =
@@ -382,8 +430,7 @@ bool SubmitOot3dPicaVulkanDrawPlan(
             std::chrono::duration<double>(now - phaseStart).count();
         phaseStart = now;
     }
-    const bool submitted =
-        renderingApi.SubmitPicaDraw(draw, error);
+    const bool submitted = consume(draw);
     if (timing != nullptr) {
         timing->BackendSubmissionSeconds +=
             std::chrono::duration<double>(Clock::now() - phaseStart).count();
@@ -391,10 +438,50 @@ bool SubmitOot3dPicaVulkanDrawPlan(
     return submitted;
 }
 
+} // namespace
+
+Oot3dPicaAlphaTest DecodeOot3dPicaAlphaTest(uint32_t alphaTestRegister) {
+    return {
+        (alphaTestRegister & 1U) != 0U,
+        static_cast<uint8_t>((alphaTestRegister >> 4U) & 7U),
+        static_cast<uint8_t>((alphaTestRegister >> 8U) & 0xFFU),
+    };
+}
+
+bool SubmitOot3dPicaVulkanDrawPlan(
+    Oot3d::Renderer::PicaRenderBackend& renderingApi,
+    const Oot3dPicaVulkanDrawPlan& plan, std::string* error,
+    uint64_t renderTargetNamespace,
+    const Oot3dPicaVulkanDrawOverrides* overrides,
+    Oot3dPicaVulkanDrawBridgeTiming* timing) {
+    return WithOot3dPicaVulkanDrawView(
+        plan, error, renderTargetNamespace, overrides, timing, true,
+        [&](const Oot3d::Renderer::PicaDrawView& draw) {
+            return renderingApi.SubmitPicaDraw(draw, error);
+        });
+}
+
+bool PrepareOot3dPicaVulkanSequenceDraw(
+    Oot3d::Renderer::PicaRenderBackend& renderingApi,
+    const Oot3dPicaVulkanDrawPlan& plan, std::string* error,
+    uint64_t renderTargetNamespace,
+    const Oot3dPicaVulkanDrawOverrides* overrides) {
+    // Preparation consumers inspect more than shadow alpha testing: grass
+    // classifies explicit/twin sources and evaluates alpha-blended overlays.
+    // Preserve the same texture identities, payloads and TEV/uniform state as
+    // submission, including opaque and non-alpha-tested transparent draws.
+    return WithOot3dPicaVulkanDrawView(
+        plan, error, renderTargetNamespace, overrides, nullptr, true,
+        [&](const Oot3d::Renderer::PicaDrawView& draw) {
+            return renderingApi.PreparePicaSequenceDraw(draw, error);
+        });
+}
+
 bool SubmitOot3dPicaVulkanDisplayTransfer(
     Oot3d::Renderer::PicaRenderBackend& renderingApi,
     const Oot3dPicaDisplayTransferSubmission& submission,
     bool present, std::string* error, uint64_t renderTargetNamespace,
+    bool materializeGuest,
     Oot3d::Renderer::PicaPresentationMode presentationMode) {
     const auto& transfer = submission.Transfer;
     Oot3d::Renderer::PicaDisplayTransferView view;
@@ -414,6 +501,13 @@ bool SubmitOot3dPicaVulkanDisplayTransfer(
     view.OutputHeight = static_cast<uint16_t>(
         declaredOutputHeight >> (scaling == 2U ? 1U : 0U));
     view.Flags = transfer.Flags;
+    view.TextureCopyBytes = transfer.TextureCopyBytes;
+    view.AfterDrawSubmissionId = submission.AfterDrawSubmissionId;
+    view.MaterializeGuest = materializeGuest;
+    if (transfer.TextureCopyBytes != 0U) {
+        view.OutputWidth = declaredOutputWidth;
+        view.OutputHeight = declaredOutputHeight;
+    }
     view.Present = present;
     view.PresentationMode = presentationMode;
     return renderingApi.SubmitPicaDisplayTransfer(view, error);

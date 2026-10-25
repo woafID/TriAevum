@@ -5,6 +5,141 @@
 #include <limits>
 
 namespace ThreeDsRecomp::Input {
+
+double ConsumeInputPeriod(double pollSeconds, bool consume, double& pendingSeconds) noexcept {
+    const double elapsed = std::isfinite(pollSeconds) ? std::clamp(pollSeconds, 0.0, 0.25) : 0.0;
+    pendingSeconds = std::min(0.25, pendingSeconds + elapsed);
+    const double period = std::max(0.001, consume ? pendingSeconds : elapsed);
+    if (consume) pendingSeconds = 0.0;
+    return period;
+}
+
+MotionSource NormalizeCameraSource(MotionSource source) noexcept {
+    switch (source) {
+    case MotionSource::ControllerGyroscope:
+    case MotionSource::ControllerAccelerometer:
+    case MotionSource::ControllerMotion:
+        return MotionSource::RightStick;
+    default:
+        return source;
+    }
+}
+
+// Adapted from encounter/aurora lib/input.cpp (MIT, Luke Street).
+// Pinned provenance and retained license: LICENSES/Aurora-MIT.txt.
+std::string NormalizeControllerSerial(std::string_view serial) {
+    std::string result;
+    for (char c : serial) {
+        if (c == ':' || c == '-') continue;
+        result += c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+    return result;
+}
+
+bool MatchesController(const DeviceDescriptor& device, std::string_view guid,
+                       std::string_view serial) {
+    return (guid.empty() || device.Guid == guid) &&
+        (serial.empty() || (!device.Serial.empty() &&
+         NormalizeControllerSerial(serial) == NormalizeControllerSerial(device.Serial)));
+}
+
+std::int32_t SelectControllerDevice(std::span<const DeviceDescriptor> devices,
+    std::string_view guid, std::string_view serial, std::int32_t previousInstance) {
+    std::int32_t selected = -1;
+    for (const auto& device : devices) {
+        if (device.InstanceId < 0 || !MatchesController(device, guid, serial)) continue;
+        if (device.InstanceId == previousInstance) return previousInstance;
+        if (selected < 0 || device.InstanceId < selected) selected = device.InstanceId;
+    }
+    return selected;
+}
+
+namespace {
+
+bool FiniteVector(const std::array<float, 3>& value) noexcept {
+    return std::all_of(value.begin(), value.end(), [](float v) { return std::isfinite(v); });
+}
+
+} // namespace
+
+MotionObservation ConvertSdlMotion(const std::array<float, 3>& accel, bool accelValid,
+                                   const std::array<float, 3>& gyro, bool gyroValid) noexcept {
+    // Citra/Azahar SDL sensor mapping, GPL-2.0-or-later; see THIRD_PARTY_NOTICES.md.
+    MotionObservation result;
+    constexpr float gravity = 9.80665F;
+    constexpr float toDegrees = 57.2957795130823208768F;
+    if (accelValid && FiniteVector(accel)) {
+        result.Accelerometer = {accel[0] / gravity, -accel[1] / gravity, accel[2] / gravity};
+        result.AccelerometerValid = FiniteVector(result.Accelerometer);
+    }
+    if (gyroValid && FiniteVector(gyro)) {
+        result.GyroscopeDegreesPerSecond = {-gyro[0] * toDegrees, gyro[1] * toDegrees, -gyro[2] * toDegrees};
+        result.GyroscopeValid = FiniteVector(result.GyroscopeDegreesPerSecond);
+    }
+    return result;
+}
+
+void MotionCalibrationAccumulator::Reset() noexcept { *this = {}; }
+
+bool MotionCalibrationAccumulator::Observe(const MotionObservation& observation) noexcept {
+    const auto magnitudeSquared = [](const auto& vector) {
+        return vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
+    };
+    const bool gyro = observation.GyroscopeValid;
+    const bool accel = observation.AccelerometerValid;
+    if (!gyro && !accel) return false;
+    // Manual calibration only. Reject motion/free fall, not ordinary gameplay
+    // samples. Low-rate intentional rotation cannot be distinguished from bias.
+    const float gravitySquared = magnitudeSquared(observation.Accelerometer);
+    if ((gyro && (!FiniteVector(observation.GyroscopeDegreesPerSecond) ||
+                  magnitudeSquared(observation.GyroscopeDegreesPerSecond) > 64.0F)) ||
+        (accel && (!FiniteVector(observation.Accelerometer) ||
+                   gravitySquared < 0.64F || gravitySquared > 1.44F))) {
+        mGyroscopeSum = {}; mAccelerometerSum = {};
+        mGyroscopeCount = mAccelerometerCount = 0;
+        mWaitingForStillness = true;
+        return false;
+    }
+    mWaitingForStillness = false;
+    const auto fresh = [](std::uint64_t timestamp, std::uint64_t& last) {
+        if (timestamp != 0 && timestamp <= last) return false;
+        last = timestamp;
+        return true;
+    };
+    if (gyro && fresh(observation.GyroscopeTimestampMicroseconds, mGyroscopeTimestamp)) {
+        for (std::size_t i = 0; i < 3; ++i) mGyroscopeSum[i] += observation.GyroscopeDegreesPerSecond[i];
+        ++mGyroscopeCount;
+    }
+    if (accel && fresh(observation.AccelerometerTimestampMicroseconds, mAccelerometerTimestamp)) {
+        for (std::size_t i = 0; i < 3; ++i) mAccelerometerSum[i] += observation.Accelerometer[i];
+        ++mAccelerometerCount;
+    }
+    return SamplesCollected() >= SamplesRequired;
+}
+
+std::uint32_t MotionCalibrationAccumulator::SamplesCollected() const noexcept {
+    return mGyroscopeCount && mAccelerometerCount ? std::min(mGyroscopeCount, mAccelerometerCount)
+                                                 : std::max(mGyroscopeCount, mAccelerometerCount);
+}
+
+MotionObservation MotionCalibrationAccumulator::Mean() const noexcept {
+    MotionObservation result;
+    result.GyroscopeValid = mGyroscopeCount != 0;
+    result.AccelerometerValid = mAccelerometerCount != 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        if (mGyroscopeCount) result.GyroscopeDegreesPerSecond[i] = static_cast<float>(mGyroscopeSum[i] / mGyroscopeCount);
+        if (mAccelerometerCount) result.Accelerometer[i] = static_cast<float>(mAccelerometerSum[i] / mAccelerometerCount);
+    }
+    return result;
+}
+
+TouchMapping MapNormalizedTouch(const NormalizedTouch& touch) noexcept {
+    if (!touch.Pressed || !std::isfinite(touch.X) || !std::isfinite(touch.Y) ||
+        touch.X < 0.0F || touch.X > 1.0F || touch.Y < 0.0F || touch.Y > 1.0F) return {};
+    return {static_cast<std::uint16_t>(std::min(touch.X * kTouchWidth, float(kTouchWidth - 1))),
+            static_cast<std::uint16_t>(std::min(touch.Y * kTouchHeight, float(kTouchHeight - 1))), true, true};
+}
+
 namespace {
 
 template <typename Enum>
@@ -430,6 +565,7 @@ ResolvedMotion ResolveMotion(const MappingConfig& config,
                 config.ControllerGyroscopeSensitivity;
         }
         result.Gyroscope[0] *= invertY;
+        result.Gyroscope[1] *= invertX;
         result.Gyroscope[2] *= invertX;
         result.GyroscopeValid = true;
         return true;
@@ -475,20 +611,44 @@ ResolvedMotion ResolveMotion(const MappingConfig& config,
         static_cast<void>(useControllerAccelerometer());
         break;
     case MotionSource::Automatic:
-        if (physical.MouseDeltaX != 0 || physical.MouseDeltaY != 0) {
-            useMouse();
-        } else if (cStick[0] != 0.0F || cStick[1] != 0.0F) {
-            useCStick();
-        } else if (physical.ControllerMotion.GyroscopeValid ||
-                   physical.ControllerMotion.AccelerometerValid) {
-            static_cast<void>(useControllerGyroscope());
-            static_cast<void>(useControllerAccelerometer());
-        } else if (virtualMotion != nullptr && virtualMotion->Active) {
-            result.GyroscopeValid = true;
-            result.AccelerometerValid = true;
-            synthetic = true;
+        {
+            VirtualMotionState temporary;
+            auto& state = virtualMotion ? *virtualMotion : temporary;
+            auto owner = state.AutomaticOwner;
+            const bool controllerIntent =
+                (physical.ControllerPressed | (physical.ControllerButtons & ~state.PreviousControllerButtons)) != 0 ||
+                ConvertHostAxisToNative(physical.RightStickX, config.CStickDeadZonePercent) != 0 ||
+                ConvertHostAxisToNative(physical.RightStickY, config.CStickDeadZonePercent) != 0 ||
+                ConvertHostAxisToNative(physical.LeftStickX, config.CirclePadDeadZonePercent) != 0 ||
+                ConvertHostAxisToNative(physical.LeftStickY, config.CirclePadDeadZonePercent) != 0;
+            if (physical.MouseDeltaX != 0 || physical.MouseDeltaY != 0) owner = VirtualMotionState::Owner::Mouse;
+            else if (controllerIntent) owner = VirtualMotionState::Owner::Controller;
+            else if (owner == VirtualMotionState::Owner::None)
+                owner = state.Active ? VirtualMotionState::Owner::Mouse : VirtualMotionState::Owner::Controller;
+
+            const bool controller = owner == VirtualMotionState::Owner::Controller;
+            if (controller) useCStick(); else useMouse();
+            const float pitch = result.Gyroscope[0], yaw = result.Gyroscope[1];
+            result = {};
+            if (controller) {
+                useControllerGyroscope();
+                useControllerAccelerometer();
+            }
+            const bool physicalBase = controller && (result.GyroscopeValid || result.AccelerometerValid ||
+                (state.Composition.Initialized && state.Composition.PhysicalBase));
+            const auto composed = state.Composition.Sample(result.Accelerometer, result.AccelerometerValid,
+                result.Gyroscope, pitch, yaw, seconds, physicalBase, advanceState);
+            result.Gyroscope = composed.AngularVelocity;
+            result.Accelerometer = composed.Gravity;
+            result.GyroscopeValid = result.AccelerometerValid = true;
+            if (advanceState) {
+                state.AutomaticOwner = owner;
+                state.PreviousControllerButtons = physical.ControllerButtons;
+                state.PitchRadians = std::atan2(double(result.Accelerometer[2]), -double(result.Accelerometer[1]));
+                state.Active = !physicalBase;
+            }
+            return result;
         }
-        break;
     }
     if (synthetic) {
         constexpr double radiansPerDegree = 3.14159265358979323846 / 180.0;
@@ -506,6 +666,8 @@ ResolvedMotion ResolveMotion(const MappingConfig& config,
         if (virtualMotion != nullptr && advanceState) {
             virtualMotion->PitchRadians = nextPitch;
             virtualMotion->Active = true;
+            virtualMotion->Composition.RestoreGravity(result.Accelerometer);
+            virtualMotion->AutomaticOwner = VirtualMotionState::Owner::None;
         }
     } else if (virtualMotion != nullptr && advanceState) {
         // A physical sensor owns both vectors. Rebase a later virtual source
@@ -534,14 +696,10 @@ AxisInputSample ResolveCStick(const MappingConfig& config,
                               std::int16_t digitalCStickX,
                               std::int16_t digitalCStickY,
                               const std::array<float, 2>& rawCStick) noexcept {
-    MotionSource source = config.CStickSource;
+    MotionSource source = NormalizeCameraSource(config.CStickSource);
     if (source == MotionSource::Automatic) {
         if (physical.MouseDeltaX != 0 || physical.MouseDeltaY != 0) {
             source = MotionSource::Mouse;
-        } else if (rawCStick[0] != 0.0F || rawCStick[1] != 0.0F) {
-            source = MotionSource::RightStick;
-        } else if (physical.ControllerMotion.GyroscopeValid) {
-            source = MotionSource::ControllerGyroscope;
         } else {
             source = MotionSource::RightStick;
         }
@@ -570,26 +728,7 @@ AxisInputSample ResolveCStick(const MappingConfig& config,
         break;
     case MotionSource::ControllerGyroscope:
     case MotionSource::ControllerMotion:
-        if (physical.ControllerMotion.GyroscopeValid) {
-            x = (physical.ControllerMotion.GyroscopeDegreesPerSecond[2] -
-                 config.GyroscopeBiasDegreesPerSecond[2]) *
-                config.CStickSensorSensitivity;
-            y = -(physical.ControllerMotion.GyroscopeDegreesPerSecond[0] -
-                  config.GyroscopeBiasDegreesPerSecond[0]) *
-                config.CStickSensorSensitivity;
-        }
-        break;
     case MotionSource::ControllerAccelerometer:
-        if (physical.ControllerMotion.AccelerometerValid) {
-            x = (physical.ControllerMotion.Accelerometer[0] -
-                 config.AccelerometerNeutral[0]) *
-                static_cast<float>(kNativeStickMaximum) *
-                config.CStickSensorSensitivity;
-            y = -(physical.ControllerMotion.Accelerometer[2] -
-                  config.AccelerometerNeutral[2]) *
-                static_cast<float>(kNativeStickMaximum) *
-                config.CStickSensorSensitivity;
-        }
         break;
     case MotionSource::Automatic:
         break;
@@ -604,10 +743,18 @@ AxisInputSample ResolveCStick(const MappingConfig& config,
 } // namespace
 
 void VirtualMotionState::RestoreGravity(const std::array<float, 3>& gravity) noexcept {
+    *this = {};
     PitchRadians = std::isfinite(gravity[1]) && std::isfinite(gravity[2]) &&
                            (gravity[1] != 0.0F || gravity[2] != 0.0F) ?
         std::atan2(static_cast<double>(gravity[2]), -static_cast<double>(gravity[1])) : 0.0;
     Active = true;
+    Composition.RestoreGravity(gravity);
+}
+
+void VirtualMotionState::ResetController() noexcept {
+    PreviousControllerButtons = 0;
+    if (AutomaticOwner == Owner::Controller) AutomaticOwner = Owner::None;
+    Composition.ResetReference();
 }
 
 void HostBindingCapture::Begin(BindingDevice device) noexcept {

@@ -53,6 +53,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "of existing assignments, or direct-call affinity placement"
         ),
     )
+    parser.add_argument(
+        "--callback-free-region", action="append", type=lambda value: int(value, 0),
+        default=[], help="experimental closed call-free function entry (repeatable)",
+    )
+    parser.add_argument(
+        "--memory-region", action="append", type=lambda value: int(value, 0),
+        default=[], help="experimental memory-region function entry (repeatable)",
+    )
+    parser.add_argument(
+        "--local-state", action="store_true",
+        help="experimental: keep promoted GPRs/flags in locals in every function",
+    )
     args = parser.parse_args(argv)
     if args.shards <= 0:
         parser.error("--shards must be positive")
@@ -67,6 +79,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output,
         shard_count=args.shards,
         shard_strategy=args.shard_strategy,
+        region_entries=frozenset(args.callback_free_region),
+        memory_entries=frozenset(args.memory_region),
+        local_state=args.local_state,
     )
     functions = manifest["functions"]
     print(

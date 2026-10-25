@@ -91,6 +91,20 @@ enum class NativeA32ProcessRunKind : uint8_t {
     Faulted,
 };
 
+// What Run() reports when the current thread stopped (waited, exited or
+// faulted) and no other thread is ready. One thread's ExitThread ends the
+// process only when every thread has exited; while others wait, the
+// process waits too (the movie decoder's thread exits at a vision's end).
+constexpr NativeA32ProcessRunKind ResolveStoppedThreadRunKind(
+    NativeA32ProcessRunKind kind, bool allThreadsTerminated) noexcept {
+    if (allThreadsTerminated) {
+        return NativeA32ProcessRunKind::Terminated;
+    }
+    return kind == NativeA32ProcessRunKind::Terminated
+               ? NativeA32ProcessRunKind::Waiting
+               : kind;
+}
+
 struct NativeA32ProcessRunResult {
     NativeA32ProcessRunKind Kind = NativeA32ProcessRunKind::Faulted;
     oot3d::recomp::a32::ExecutionResult Exit;
@@ -170,7 +184,7 @@ class NativeA32Process {
         void* user = nullptr);
     void SetTimingEnabled(bool enabled) noexcept;
     NativeA32ProcessTimingStats TimingStats() const noexcept;
-    uint64_t StateFingerprint() const noexcept;
+    uint64_t StateFingerprint() const;
     nlohmann::json CaptureState() const;
     bool RestoreState(const nlohmann::json& state,
                       std::string* error = nullptr);
@@ -180,6 +194,8 @@ class NativeA32Process {
     oot3d::recomp::a32::GuestState& PrimaryThreadState();
     const oot3d::recomp::a32::GuestState& PrimaryThreadState() const;
     NativeA32ThreadStatus PrimaryThreadStatus() const;
+    bool OnlyBackgroundThreadsReady() const;
+    uint32_t DispatchBlockBudget(uint32_t requested) const;
     size_t ThreadCount() const;
     const oot3d::recomp::a32::GuestState* ThreadState(uint32_t threadId) const;
     oot3d::recomp::a32::GuestState* ThreadState(uint32_t threadId);

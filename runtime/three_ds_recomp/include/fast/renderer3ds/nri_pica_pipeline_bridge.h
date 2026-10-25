@@ -4,10 +4,12 @@
 
 #include "fast/renderer3ds/nri_pica_interop.h"
 #include "fast/renderer3ds/pica_attachment_contract.h"
+#include "fast/renderer3ds/pica_pbr_material.h"
 
 #include <vulkan/vulkan.h>
 
 #include <cstddef>
+#include <compare>
 #include <array>
 #include <memory>
 #include <span>
@@ -16,12 +18,44 @@
 
 namespace Fast::Renderer3ds {
 
+// Logical ownership identity, never a Vulkan handle or a driver object address.
+struct NriPicaPipelineId {
+    uint64_t Value = 0;
+    explicit operator bool() const { return Value != 0; }
+    auto operator<=>(const NriPicaPipelineId&) const = default;
+};
+
+struct PicaDevicePipelineRecord {
+    NriPicaPipelineId Id;
+    VkPipeline Vulkan = VK_NULL_HANDLE;
+    bool NriPreparationAttempted = false;
+};
+
 struct NriPicaExecutionConfig {
     uint32_t FrameSlotCount = 2U;
-    uint32_t MaxDrawsPerFrame = 512U;
+    // Allocation granularity, not a limit on the number of draws in a frame.
+    uint32_t DescriptorSetsPerPool = 512U;
     bool OwnedDraws = true;
     bool PreferOwnedUploads = false;
+    // Default factory of every pipeline: library parts plus a fast link.
+    bool PipelineLibrariesEnabled = false;
+    // The device negotiated graphics pipeline libraries: an explicit
+    // NriPicaPipelineFactory::Libraries request may use them.
+    bool PipelineLibrariesAvailable = false;
 };
+
+enum class NriPicaPipelineFactory : uint8_t {
+    // PipelineLibrariesEnabled decides.
+    Default,
+    // One optimized driver pipeline.
+    Monolithic,
+    // A fast link of independently prepared library parts (when available).
+    Libraries,
+};
+
+enum class NriPicaPipelineRequest : uint8_t { Ready, Pending, Failed };
+
+class PicaPreparationQueue;
 
 struct NriPicaGraphicsPipelineDesc {
     std::span<const uint32_t> VertexSpirv;
@@ -49,6 +83,10 @@ struct NriPicaGraphicsPipelineDesc {
     VkFormat DepthStencilFormat = VK_FORMAT_UNDEFINED;
 };
 
+// TRIAEVUM_NRI_PIPELINE_TRACE: content hash of a program in the trace lines.
+[[nodiscard]] uint64_t NriPicaTraceProgramHash(std::span<const uint32_t> words) noexcept;
+[[nodiscard]] bool NriPicaPipelineTraceEnabled() noexcept;
+
 struct NriPicaTextureBindingDesc {
     VkImage Image = VK_NULL_HANDLE;
     VkFormat Format = VK_FORMAT_UNDEFINED;
@@ -67,6 +105,8 @@ struct NriPicaTextureBindingDesc {
     bool Integer = false;
 };
 
+inline constexpr size_t kNriPicaUniformBindingCount = 7U;
+
 struct NriPicaUniformBindingDesc {
     uint64_t Offset = 0;
     uint64_t Size = 0;
@@ -82,12 +122,14 @@ struct NriPicaVertexBufferBindingDesc {
 struct NriPicaOwnedDrawDesc {
     uint32_t FrameIndex = 0;
     uint64_t FrameId = 0;
-    VkPipeline FallbackPipeline = VK_NULL_HANDLE;
+    NriPicaPipelineId PipelineId;
     VkBuffer UniformBuffer = VK_NULL_HANDLE;
     uint64_t UniformBufferSize = 0;
     uint8_t* UniformMappedMemory = nullptr;
-    // Vertex, fragment, previous-vertex and directional-shadow receiver UBOs.
-    std::array<NriPicaUniformBindingDesc, 4> Uniforms{};
+    // Vertex, fragment, previous-vertex, shadow, style, lighting and PBR UBOs.
+    std::array<NriPicaUniformBindingDesc, kNriPicaUniformBindingCount> Uniforms{};
+    // Read-only seam data in the original mapped uniform/storage arena.
+    NriPicaUniformBindingDesc SeamGeometry{};
     VkBuffer VertexBuffer = VK_NULL_HANDLE;
     uint64_t VertexBufferSize = 0;
     uint8_t* VertexMappedMemory = nullptr;
@@ -100,6 +142,10 @@ struct NriPicaOwnedDrawDesc {
     std::array<NriPicaTextureBindingDesc, 3> Textures{};
     NriPicaTextureBindingDesc DirectionalShadowTexture;
     NriPicaTextureBindingDesc LightingLutTexture;
+    // Point-shadow atlas; a neutral image when the draw receives none.
+    NriPicaTextureBindingDesc PointShadowTexture;
+    NriPicaTextureBindingDesc ContactShadowTexture;
+    std::array<NriPicaTextureBindingDesc, kPicaPbrTextureCount> PbrTextures{};
     VkImage StorageImage = VK_NULL_HANDLE;
     VkFormat StorageFormat = VK_FORMAT_UNDEFINED;
     uint32_t StorageWidth = 0;
@@ -116,7 +162,17 @@ struct NriPicaPipelineStatistics {
     uint64_t InitialCacheBytes = 0;
     uint64_t CreationAttempts = 0;
     uint64_t Created = 0;
+    uint64_t OwnedReuses = 0;
     uint64_t CreationNanoseconds = 0;
+    // Creations the driver refused at least once, and those it then accepted
+    // as a whole pipeline after refusing the library parts.
+    uint64_t CreationFailures = 0;
+    uint64_t LibraryFallbacks = 0;
+    // Owned pipelines created by a preparation thread, and draws that had to
+    // run or wait for such a creation on the render thread.
+    uint64_t BackgroundRequests = 0;
+    uint64_t BackgroundCreated = 0;
+    uint64_t BackgroundCompletions = 0;
 };
 
 class NriPicaPipelineBridge final {
@@ -133,15 +189,30 @@ class NriPicaPipelineBridge final {
     [[nodiscard]] NriPicaPipelineStatistics PipelineStatistics() const;
     // Uses the live pipeline factory, then releases the pipeline. No draw,
     // framebuffer, upload allocation or fake Vulkan pipeline handle is needed.
-    bool PreparePipeline(const NriPicaGraphicsPipelineDesc& desc);
+    bool PreparePipeline(const NriPicaGraphicsPipelineDesc& desc,
+                         NriPicaPipelineFactory factory = NriPicaPipelineFactory::Default);
     bool CreateOwnedPipeline(
-        VkPipeline fallbackPipeline,
-        const NriPicaGraphicsPipelineDesc& desc);
+        NriPicaPipelineId pipelineId,
+        const NriPicaGraphicsPipelineDesc& desc,
+        NriPicaPipelineFactory factory = NriPicaPipelineFactory::Default);
+    // Render thread. Ready when the id already owns a pipeline or an equal
+    // device object exists; otherwise a task on queue creates it (Pending).
+    // The description is copied; the queue must outlive Reset().
+    NriPicaPipelineRequest RequestOwnedPipeline(
+        NriPicaPipelineId pipelineId, const NriPicaGraphicsPipelineDesc& desc,
+        NriPicaPipelineFactory factory, PicaPreparationQueue& queue);
+    // Render thread. Adopts a finished creation.
+    NriPicaPipelineRequest PollOwnedPipeline(NriPicaPipelineId pipelineId);
+    // Render thread. Runs the creation inline if no worker started it, or
+    // waits for it: only for a draw that has no other program.
+    NriPicaPipelineRequest CompleteOwnedPipeline(NriPicaPipelineId pipelineId);
+    [[nodiscard]] size_t PendingOwnedPipelineCount() const;
     bool BindOwnedDraw(const NriPicaOwnedDrawDesc& desc);
     // Same layout/resources as the immediately preceding owned draw; no uploads.
     bool DrawBoundGeometry(const NriPicaOwnedDrawDesc& desc);
     bool Bind(uint32_t frameIndex, VkPipeline pipeline);
     void Forget(VkPipeline pipeline);
+    void ForgetOwned(NriPicaPipelineId pipelineId);
     void Reset();
     void Shutdown();
 
@@ -151,14 +222,25 @@ class NriPicaPipelineBridge final {
     [[nodiscard]] bool OwnedDrawsEnabled() const;
     [[nodiscard]] bool LastDrawUploadsOwnedByNri() const;
     [[nodiscard]] uint64_t LastDrawUploadedBytes() const;
-    [[nodiscard]] bool OwnedPipelineReady(VkPipeline fallbackPipeline) const;
+    [[nodiscard]] bool OwnedPipelineReady(NriPicaPipelineId pipelineId) const;
     [[nodiscard]] size_t OwnedPipelineCount() const;
     [[nodiscard]] size_t WrappedPipelineCount() const;
     [[nodiscard]] const std::string& UnavailableReason() const;
+#ifdef ENABLE_RENDERER3DS_NRI
+    // The device's persisted pipeline cache, owned here (null before
+    // InitializePipelineCache). Other pipelines of the device may use it.
+    [[nodiscard]] nri::PipelineCache* PipelineCache() const;
+#endif
 
   private:
 #ifdef ENABLE_RENDERER3DS_NRI
-    nri::Pipeline* CreatePipeline(const NriPicaGraphicsPipelineDesc& desc);
+    // Thread-safe: preparation threads create owned pipelines concurrently.
+    nri::Pipeline* CreatePipeline(const NriPicaGraphicsPipelineDesc& desc,
+                                  NriPicaPipelineFactory factory);
+    void AdoptOwnedPipeline(NriPicaPipelineId pipelineId,
+                            std::shared_ptr<nri::Pipeline> owned,
+                            const NriPicaGraphicsPipelineDesc& desc);
+    void CompleteAllPendingPipelines();
 #endif
     struct Impl;
     std::unique_ptr<Impl> mImpl;

@@ -54,7 +54,13 @@ struct PicaToonInstrumentation {
     }
 };
 
-[[nodiscard]] PicaToonEligibility ClassifyPicaToonDraw(
+[[nodiscard]] // Toon declarations of the always-available program: parametersBlock declares
+// oot3d_uber (with a ToonSurfaceParameters toon member) after the parameter
+// structure; vertexLighting is the GLSL value of flags.y.
+[[nodiscard]] std::string PicaToonUberDeclarations(std::string_view parametersBlock,
+                                                   std::string_view vertexLighting);
+
+PicaToonEligibility ClassifyPicaToonDraw(
     const PicaToonDrawInfo& draw, ToonMode mode);
 
 [[nodiscard]] PicaToonShaderVariant BuildPicaToonShaderVariant(
@@ -65,6 +71,7 @@ struct PicaToonInstrumentation {
 [[nodiscard]] PicaToonInstrumentation BuildPicaToonInstrumentation(
     uint64_t originalFragmentKey, const PicaToonDrawInfo& draw,
     ToonMode mode, const ToonStyleSettings& style,
-    const ::Oot3d::Renderer::PicaShaderHookLayout& hooks);
+    const ::Oot3d::Renderer::PicaShaderHookLayout& hooks,
+    bool uniformParameters = false, bool drawControl = false);
 
 } // namespace Fast::Oot3d

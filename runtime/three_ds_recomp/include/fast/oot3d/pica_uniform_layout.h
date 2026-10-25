@@ -68,8 +68,13 @@ inline constexpr std::size_t kPicaPackedFragmentShadowBiasConstantOffset =
     kPicaPackedFragmentShadowOrthographicOffset + sizeof(std::int32_t);
 inline constexpr std::size_t kPicaPackedFragmentShadowBiasLinearOffset =
     kPicaPackedFragmentShadowBiasConstantOffset + sizeof(float);
-inline constexpr std::size_t kPicaPackedFragmentUniformSize =
+inline constexpr std::size_t kPicaPackedFragmentLegacyUniformSize =
     kPicaPackedFragmentShadowBiasLinearOffset + sizeof(float);
+inline constexpr std::size_t kPicaPackedFragmentTevProgramOffset = kPicaPackedFragmentLegacyUniformSize;
+inline constexpr std::size_t kPicaPackedFragmentLightingProgramOffset = kPicaPackedFragmentTevProgramOffset + 112U;
+inline constexpr std::size_t kPicaPackedFragmentControlOffset = kPicaPackedFragmentLightingProgramOffset + 256U;
+inline constexpr std::size_t kPicaPackedFragmentProcTexOffset = kPicaPackedFragmentControlOffset + 16U;
+inline constexpr std::size_t kPicaPackedFragmentUniformSize = kPicaPackedFragmentProcTexOffset + 3616U;
 
 static_assert(kPicaPackedVertexFloatOffset == 80U);
 static_assert(kPicaPackedFragmentFogColorOffset == 128U);
@@ -81,6 +86,10 @@ static_assert(kPicaPackedFragmentShadowTextureBiasOffset == 2096U);
 static_assert(kPicaPackedFragmentShadowOrthographicOffset == 2100U);
 static_assert(kPicaPackedFragmentShadowBiasConstantOffset == 2104U);
 static_assert(kPicaPackedFragmentShadowBiasLinearOffset == 2108U);
-static_assert(kPicaPackedFragmentUniformSize == 2112U);
+static_assert(kPicaPackedFragmentTevProgramOffset == 2112U);
+static_assert(kPicaPackedFragmentLightingProgramOffset == 2224U);
+static_assert(kPicaPackedFragmentControlOffset == 2480U);
+static_assert(kPicaPackedFragmentProcTexOffset == 2496U);
+static_assert(kPicaPackedFragmentUniformSize == 6112U);
 
 } // namespace Fast::Oot3d

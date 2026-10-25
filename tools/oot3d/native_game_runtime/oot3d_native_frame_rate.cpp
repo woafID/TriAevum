@@ -222,7 +222,9 @@ float NativeVisualSampleCadence::Resolve(
         mHasSourceFrame = true;
         mStats.SampleOrdinal = 0U;
         ++mStats.NewSourceFrames;
-        return 0.0F;
+        return mFixedSampleMultiplier == 0U
+                   ? 0.0F
+                   : 1.0F / static_cast<float>(mFixedSampleMultiplier);
     }
     if (mFixedSampleMultiplier == 0U) {
         return ResolveDelayedVisualSampleAlpha(
@@ -237,7 +239,7 @@ float NativeVisualSampleCadence::Resolve(
     } else {
         ++mStats.ClampedRepeatedSamples;
     }
-    return static_cast<float>(mStats.SampleOrdinal) /
+    return static_cast<float>(mStats.SampleOrdinal + 1U) /
            static_cast<float>(mFixedSampleMultiplier);
 }
 
@@ -591,7 +593,11 @@ void NativeFrameRatePolicy::ResetGameplayClock() {
 }
 
 bool NativeFrameRatePolicy::RestoreGameplayClock(
-    const NativeGameplayClockState& state) {
+    GameplayTimingMode sourceMode, const NativeGameplayClockState& state) {
+    if (SimulationRateForMode(sourceMode) != mContract.SimulationRateHz) {
+        mLastError = "savestate and runtime simulation rates differ";
+        return false;
+    }
     return mGameplayClock.Restore(state, &mLastError);
 }
 

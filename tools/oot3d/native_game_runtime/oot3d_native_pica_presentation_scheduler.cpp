@@ -1,6 +1,8 @@
 #include "oot3d_native_pica_presentation_scheduler.h"
 
+#include "oot3d_native_pica_composition.h"
 #include "oot3d_native_pica_vulkan_bridge.h"
+#include "oot3d_static_shadow_actor_catalog.h"
 
 #include <chrono>
 #include <string_view>
@@ -71,13 +73,31 @@ std::optional<Oot3dPicaVisualFrame> Oot3dPicaPresentationScheduler::FinishFrame(
   return frame;
 }
 
+std::vector<Oot3dPicaVisualFrame> Oot3dPicaPresentationScheduler::FinishFrames(
+    const Oot3dPicaDisplayTransferSubmission &topTransfer,
+    std::span<const uint32_t> displayOutputs,
+    std::span<const Oot3dPicaViewportState> continuationViewports) {
+  auto frames = mAccumulator.FinishFrames(topTransfer, displayOutputs,
+                                          continuationViewports);
+  mStats.CompletedVisualFrames += frames.size();
+  mStats.SupersededVisualFrames += frames.empty() ? 0U : frames.size() - 1U;
+  return frames;
+}
+
 void Oot3dPicaPresentationScheduler::BeginPresentation(
     uint64_t presentationSerial) {
   if (mPresentationSerial == presentationSerial) {
     return;
   }
   mPresentationSerial = presentationSerial;
-  mExecutedDrawsThisPresentation.clear();
+  for (auto& [targetNamespace, draws] : mExecutedDrawsThisPresentation) {
+    draws.clear();
+  }
+}
+
+bool Oot3dPicaPresentationScheduler::ViewDependencyWork(
+    Oot3dPicaVisualFrameViewSample& output) {
+  return mAccumulator.ViewDependencyWork(output);
 }
 
 Oot3dPicaPresentationSchedulerState
@@ -106,8 +126,8 @@ bool Oot3dPicaPresentationScheduler::Execute(
     SetError(error, "PICA presentation execution began without a host frame");
     return false;
   }
-  if (sample.MemoryFills == nullptr || sample.DisplayTransfers == nullptr ||
-      sample.Draws.empty()) {
+  if (sample.Draws.empty() && sample.DisplayTransfers.empty() &&
+      kind == Oot3dPicaPresentationExecutionKind::DependencyFlush) {
     SetError(error, "PICA presentation sample is incomplete");
     return false;
   }
@@ -117,26 +137,41 @@ bool Oot3dPicaPresentationScheduler::Execute(
                                   mTimings.ValidationSeconds);
     std::unordered_set<uint64_t> sampleDraws;
     sampleDraws.reserve(sample.Draws.size());
+    auto& executedDraws =
+        mExecutedDrawsThisPresentation[renderTargetNamespace];
     for (const auto &draw : sample.Draws) {
       if (draw.BasePlan == nullptr ||
           !sampleDraws.insert(draw.BasePlan->SubmissionId).second ||
-          mExecutedDrawsThisPresentation.contains(
-              draw.BasePlan->SubmissionId)) {
+          executedDraws.contains(draw.BasePlan->SubmissionId)) {
         ++mStats.DuplicateDrawAttempts;
         SetError(error,
                  "PICA draw would execute more than once in one presentation");
         return false;
       }
     }
-    mExecutedDrawsThisPresentation.insert(sampleDraws.begin(),
-                                          sampleDraws.end());
+    executedDraws.insert(sampleDraws.begin(), sampleDraws.end());
   }
   mStats.SelectedDraws += sample.Draws.size();
+  const bool presentation =
+      kind != Oot3dPicaPresentationExecutionKind::DependencyFlush &&
+      kind != Oot3dPicaPresentationExecutionKind::NativeFrame;
 
+  // A left-out draw is neither published nor submitted, so the backend's
+  // composition schedule matches what it executes.
   mCompositionDrawScratch.clear();
   mCompositionDrawScratch.reserve(sample.Draws.size());
-  for (const auto &drawView : sample.Draws) {
-    const auto &draw = *drawView.BasePlan;
+  mOmittedDrawScratch.assign(sample.Draws.size(), false);
+  for (size_t index = 0; index < sample.Draws.size(); ++index) {
+    const auto &draw = *sample.Draws[index].BasePlan;
+    const auto domain = static_cast<Oot3d::Renderer::PicaCompositionDomain>(
+        static_cast<uint8_t>(draw.CompositionDomain));
+    if (presentation && !mNativeGameplayHudVisible &&
+        domain == Oot3d::Renderer::PicaCompositionDomain::Ui &&
+        draw.Composition.SourcePc == kOot3dGameplayHudDrawEntry) {
+      mOmittedDrawScratch[index] = true;
+      ++mStats.OmittedHudDraws;
+      continue;
+    }
     const auto &framebuffer = draw.State.Framebuffer;
     mCompositionDrawScratch.push_back({
         .SubmissionId = draw.SubmissionId,
@@ -149,8 +184,7 @@ bool Oot3dPicaPresentationScheduler::Execute(
             .ColorFormat = framebuffer.ColorFormat,
             .DepthFormat = framebuffer.DepthFormat,
         },
-        .Domain = static_cast<Oot3d::Renderer::PicaCompositionDomain>(
-            static_cast<uint8_t>(draw.CompositionDomain)),
+        .Domain = domain,
         .Composition = {
             .Layer = static_cast<Oot3d::Renderer::PicaCompositionLayer>(
                 static_cast<uint8_t>(draw.Composition.Layer)),
@@ -159,6 +193,15 @@ bool Oot3dPicaPresentationScheduler::Execute(
                     static_cast<uint8_t>(draw.Composition.Provenance)),
             .SourcePc = draw.Composition.SourcePc,
             .NativeValue = draw.Composition.NativeValue,
+            .NativeProjectedShadow = draw.Composition.NativeProjectedShadow,
+            .NativeActorGeometry = draw.Composition.NativeActorGeometry,
+            .NativeActorIdentity = draw.Composition.NativeActorIdentity,
+            .IsolatedLighting = draw.Composition.IsolatedLighting,
+            .TemporalIdentity = draw.Composition.TemporalIdentity,
+            .StaticShadowCacheEligible =
+                Oot3dNativeGame::StaticShadowCacheEligibleActor(
+                    draw.Composition.NativeActorGeometry,
+                    draw.Composition.NativeActorIdentity),
         },
     });
   }
@@ -175,6 +218,10 @@ bool Oot3dPicaPresentationScheduler::Execute(
                     kPicaCompositionSequenceSchemaVersion,
                 .SequenceId = compositionSequenceId,
                 .Draws = mCompositionDrawScratch,
+                .Purpose =
+                    presentation
+                        ? Oot3d::Renderer::PicaCompositionPurpose::Presentation
+                        : Oot3d::Renderer::PicaCompositionPurpose::NativeMemory,
             },
             error)) {
       ++mStats.CompositionPublicationFailures;
@@ -184,6 +231,30 @@ bool Oot3dPicaPresentationScheduler::Execute(
   ++mStats.CompositionSequencesPublished;
   mStats.CompositionDrawReferencesPublished +=
       mCompositionDrawScratch.size();
+
+  // Presentation work the backend needs ahead of native order (this sample's
+  // shadow casters before their receivers) receives the draws it selects
+  // first; every draw is still submitted below, in native order, exactly once.
+  // Native-memory execution keeps its canonical sequence untouched.
+  if (presentation) {
+    OptionalTimer timer(mTimings.Enabled, mTimings.DrawPreparationSeconds);
+    size_t published = 0;
+    for (size_t index = 0; index < sample.Draws.size(); ++index) {
+      if (mOmittedDrawScratch[index] ||
+          !backend.WantsPicaSequenceDrawPreparation(
+              mCompositionDrawScratch[published++])) {
+        continue;
+      }
+      const auto &drawView = sample.Draws[index];
+      const auto overrides = drawView.Overrides();
+      if (!PrepareOot3dPicaVulkanSequenceDraw(backend, *drawView.BasePlan,
+                                              error, renderTargetNamespace,
+                                              &overrides)) {
+        return false;
+      }
+      ++mStats.PreparedDraws;
+    }
+  }
 
   ++mStats.ExecutionLists;
   switch (kind) {
@@ -196,6 +267,9 @@ bool Oot3dPicaPresentationScheduler::Execute(
   case Oot3dPicaPresentationExecutionKind::RepeatedFrame:
     ++mStats.RepeatedFrameLists;
     break;
+  case Oot3dPicaPresentationExecutionKind::NativeFrame:
+    ++mStats.NativeFrameLists;
+    break;
   case Oot3dPicaPresentationExecutionKind::DependencyFlush:
     ++mStats.DependencyFlushes;
     break;
@@ -205,8 +279,8 @@ bool Oot3dPicaPresentationScheduler::Execute(
   size_t fillIndex = 0;
   size_t transferIndex = 0;
   bool topSnapshotExecuted = false;
-  const auto &fills = *sample.MemoryFills;
-  const auto &transfers = *sample.DisplayTransfers;
+  const auto fills = sample.MemoryFills;
+  const auto transfers = sample.DisplayTransfers;
   const auto submitFill = [&](const Oot3dPicaMemoryFillSubmission &fill) {
     OptionalTimer timer(mTimings.Enabled, mTimings.MemoryFillSeconds);
     if (!SubmitOot3dPicaVulkanMemoryFill(backend, fill, error,
@@ -219,8 +293,15 @@ bool Oot3dPicaPresentationScheduler::Execute(
   const auto submitTransfer = [&](const Oot3dPicaDisplayTransferSubmission
                                       &transfer) {
     OptionalTimer timer(mTimings.Enabled, mTimings.SnapshotTransferSeconds);
+    // Real execution publishes byte visibility and discharges PPF, including
+    // guarded deferred RAM. Replayed/interpolated/restored transfers recreate
+    // only the GPU version; they never publish a second guest write.
+    const bool materializeGuest =
+        kind == Oot3dPicaPresentationExecutionKind::DependencyFlush &&
+        transfer.Transfer.TextureCopyBytes != 0U && transfer.SignalInterrupt;
     if (!SubmitOot3dPicaVulkanDisplayTransfer(backend, transfer, false, error,
-                                              renderTargetNamespace)) {
+                                              renderTargetNamespace,
+                                              materializeGuest)) {
       return false;
     }
     mSnapshotCompletions[MakeSnapshotTarget(transfer, renderTargetNamespace)] =
@@ -231,7 +312,8 @@ bool Oot3dPicaPresentationScheduler::Execute(
     return true;
   };
 
-  for (const auto &drawView : sample.Draws) {
+  for (size_t drawIndex = 0; drawIndex < sample.Draws.size(); ++drawIndex) {
+    const auto &drawView = sample.Draws[drawIndex];
     const auto &draw = *drawView.BasePlan;
     while (transferIndex < transfers.size() &&
            transfers[transferIndex].AfterDrawSubmissionId < draw.SubmissionId) {
@@ -246,7 +328,7 @@ bool Oot3dPicaPresentationScheduler::Execute(
       }
     }
     const auto overrides = drawView.Overrides();
-    {
+    if (!mOmittedDrawScratch[drawIndex]) {
       OptionalTimer timer(mTimings.Enabled, mTimings.DrawSubmissionSeconds);
       Oot3dPicaVulkanDrawBridgeTiming bridgeTiming;
       const bool submitted = SubmitOot3dPicaVulkanDrawPlan(
@@ -263,8 +345,8 @@ bool Oot3dPicaPresentationScheduler::Execute(
       if (!submitted) {
         return false;
       }
+      ++mStats.ExecutedDraws;
     }
-    ++mStats.ExecutedDraws;
     while (transferIndex < transfers.size() &&
            transfers[transferIndex].AfterDrawSubmissionId ==
                draw.SubmissionId) {
@@ -284,6 +366,14 @@ bool Oot3dPicaPresentationScheduler::Execute(
     }
   }
 
+  if (kind == Oot3dPicaPresentationExecutionKind::DependencyFlush) {
+    if (present) {
+      SetError(error, "PICA dependency flush cannot present a scanout");
+      return false;
+    }
+    mAccumulator.CompleteDependencyWork();
+    return true;
+  }
   if (!topSnapshotExecuted) {
     if (!submitTransfer(sample.TopTransfer)) {
       return false;
@@ -354,6 +444,10 @@ void Oot3dPicaPresentationScheduler::Reset() {
 
 size_t Oot3dPicaPresentationScheduler::PendingDrawCount() const {
   return mAccumulator.PendingDrawCount();
+}
+
+bool Oot3dPicaPresentationScheduler::HasPendingRawCopyCompletion() const {
+  return mAccumulator.HasPendingRawCopyCompletion();
 }
 
 const Oot3dPicaPresentationSchedulerStats &

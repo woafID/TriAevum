@@ -1,3 +1,4 @@
+#include "oot3d_interior_sun_prebuild.h"
 #include <cstdlib>
 #include "oot3d_game_language.h"
 #include <array>
@@ -13,6 +14,7 @@
 #if defined(__SWITCH__) || defined(__ANDROID__)
 #include <SDL.h>
 #endif
+#include <filesystem>
 
 #include "oot3d_demo_host_context.h"
 #if defined(__ANDROID__)
@@ -27,7 +29,41 @@
 #include "triaevum_title_plugin_loader.h"
 #endif
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
+
 namespace {
+
+#ifdef _WIN32
+// The Windows package keeps every DLL in runtime/ beside the installed
+// TriAevum.exe. Libraries loaded by name (the delay-loaded shaderc and its
+// Visual C++ runtime, FidelityFX through NRI) are searched there too;
+// SetDllDirectoryW keeps the rest of the standard search (PATH included)
+// that drivers and Vulkan layers may rely on.
+void UseRuntimeLibraryDirectory() {
+    std::wstring executable(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, executable.data(), DWORD(executable.size()));
+        if (length == 0) return;
+        if (length < executable.size()) {
+            executable.resize(length);
+            break;
+        }
+        executable.resize(executable.size() * 2);
+    }
+    const auto runtime = std::filesystem::path(executable).parent_path() / "runtime";
+    std::error_code error;
+    if (std::filesystem::is_directory(runtime, error))
+        SetDllDirectoryW(runtime.c_str());
+}
+#endif
 
 #if defined(__SWITCH__)
 constexpr const char* kSwitchBootStatusPath =
@@ -62,6 +98,8 @@ void SetRendererEnvironment(const char* name,
 
 void ConfigurePicaAotShaders(const Oot3dNativeGameLaunch& launch) {
     SetRendererEnvironment("TRIAEVUM_RENDERER_CACHE_DIR", launch.RendererCacheDirectory);
+    SetRendererEnvironment("TRIAEVUM_WATER_TEXTURE_CATALOG", launch.WaterTextureCatalogPath);
+    SetRendererEnvironment("TRIAEVUM_SCENE_LIGHT_CATALOG", launch.SceneLightCatalogPath);
     SetRendererEnvironment("OOT3D_PICA_AOT_SHADER_PACK",
                            launch.PicaAotShaderPackPath);
     SetRendererEnvironment("OOT3D_PICA_EFFECTIVE_SHADER_INVENTORY",
@@ -137,7 +175,12 @@ NativeGameArguments PrepareNativeGameArguments(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    UseRuntimeLibraryDirectory();
+#endif
     try {
+        if (argc >= 2 && std::string_view(argv[1]) == "--prebuild-interior-sun")
+            return Oot3dNativeGame::InteriorSunToolMain(argc, argv);
 #if defined(__ANDROID__)
         InitializeAndroidGameHost();
 #endif
@@ -227,16 +270,11 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        if (launch.A32ProcessManifestPath.empty()) {
-            throw std::runtime_error(
-                "oot3d_native_game requires --a32-process-manifest; use "
-                "oot3d_native_game_legacy_sandbox for the standalone demo");
-        }
 #if defined(OOT3D_REQUIRE_WHOLE_AOT_PLUGIN_V2)
         if (!Oot3dNativeGame::Oot3dWholeAotPluginV2Available()) {
             throw std::runtime_error(
-                "the private whole-AOT ABI-v2 plugin is missing or invalid; "
-                "run TriAevum Forge again before launching the game");
+                "the packaged whole-AOT ABI-v2 title module is missing or incompatible "
+                "(memory visibility ABI 2 required); install a matching runtime/title package");
         }
 #endif
 #if defined(__SWITCH__)
@@ -245,6 +283,7 @@ int main(int argc, char** argv) {
         ConfigurePicaAotShaders(launch);
 #ifdef OOT3D_NATIVE_A32_WINDOW_AVAILABLE
         RunOot3dNativeA32Window(launch);
+        ClearLaunchMarkerForDemo();
         // The A32 window owns objects that refer back to the host context.
         // Destroy those locals on return before tearing the context down.
         DestroyContextForDemo();
@@ -261,6 +300,7 @@ int main(int argc, char** argv) {
 #if defined(__SWITCH__)
         WriteSwitchBootStatus("failed", ex.what());
 #endif
+        LogFatalErrorForDemo(ex.what());
         DestroyContextForDemo();
         return 1;
     }

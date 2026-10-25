@@ -10,6 +10,7 @@ the recovery pass.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import sys
@@ -39,6 +40,7 @@ from oot3d_pack.arm_ir import (  # noqa: E402
 FORMAT = "oot3d_whole_aot_program_v1"
 CACHE_FORMAT = "oot3d_whole_aot_program_cache_v1"
 DEFAULT_BASE = 0x00100000
+DEFAULT_OBSERVED_SITES = Path(__file__).resolve().with_name("whole_aot_observed_sites.json")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -339,7 +341,18 @@ def _switch_targets(
 ) -> dict[int, tuple[int, ...]]:
     """Recover dispatch-to-case edges from the literal table evidence."""
 
-    mutable: dict[int, set[int]] = {}
+    mutable: dict[int, set[int]] = {
+        source: {target} for source, target in
+        pinned._constant_pc_targets(decoder, valid_pcs, valid_pcs).items()
+    }
+    for source, (base, words) in pinned._base_relative_switch_tables(
+        decoder, valid_pcs, set(literal_sources) | valid_pcs
+    ).items():
+        mutable[source] = {
+            (base + decoder.get(word).raw) & 0xFFFFFFFF for word in words
+            if decoder.get(word).raw != 0 and
+            (base + decoder.get(word).raw) & 0xFFFFFFFF in valid_pcs
+        }
     for word, sources in literal_sources.items():
         offset = word - decoder.base
         if offset < 0 or offset + 4 > len(decoder.code):
@@ -368,7 +381,7 @@ def _edge_target(
 
 def _successors(
     item: DecodedInstruction,
-    explicit_lr_calls: set[int],
+    explicit_lr_calls: dict[int, int],
     switch_targets: dict[int, tuple[int, ...]],
 ) -> tuple[AotEdge, ...]:
     pc = item.pc
@@ -378,6 +391,8 @@ def _successors(
     if item.kind == "branch":
         if item.target is not None:
             edges.append(_edge_target(pc, "branch", item.target, condition))
+        if pc in explicit_lr_calls:
+            edges.append(_edge_target(pc, "resume", explicit_lr_calls[pc], condition))
         if condition is not None:
             edges.append(_edge_target(pc, "fallthrough", fallthrough, condition))
         return tuple(edges)
@@ -395,7 +410,7 @@ def _successors(
                 )
         elif _is_register_call(item) or pc in explicit_lr_calls:
             edges.append(AotEdge(pc, "indirect_call", condition=condition))
-            edges.append(_edge_target(pc, "resume", fallthrough, condition))
+            edges.append(_edge_target(pc, "resume", explicit_lr_calls.get(pc, fallthrough), condition))
         else:
             targets = switch_targets.get(pc, ())
             if targets:
@@ -425,7 +440,7 @@ def _successors(
                 )
         elif pc in explicit_lr_calls:
             edges.append(AotEdge(pc, "indirect_call", condition=condition))
-            edges.append(_edge_target(pc, "resume", fallthrough, condition))
+            edges.append(_edge_target(pc, "resume", explicit_lr_calls[pc], condition))
         else:
             targets = switch_targets.get(pc, ())
             if targets:
@@ -447,7 +462,7 @@ def _make_blocks(
     decoder: pinned._Decoder,
     reachable: set[int],
     block_starts: set[int],
-    explicit_lr_calls: set[int],
+    explicit_lr_calls: dict[int, int],
     switch_targets: dict[int, tuple[int, ...]],
 ) -> tuple[AotBlock, ...]:
     groups: list[list[int]] = []
@@ -697,6 +712,21 @@ def _body_hash(block_ids: Iterable[int], blocks: tuple[AotBlock, ...]) -> str:
     return digest.hexdigest()
 
 
+def load_observed_sites(path: Path, code: bytes) -> frozenset[int]:
+    """Catalogued pcs that must start a block, for this exact code image.
+
+    The runtime observes or redirects execution at these pcs (TopScreen source
+    port hooks and their resume points); whole-AOT reports only block starts.
+    A catalog for another code image does not apply.
+    """
+    catalog = json.loads(path.read_text(encoding="utf-8"))
+    if catalog.get("format") != "oot3d_whole_aot_observed_sites_v1":
+        raise ValueError(f"unsupported observed-site catalog: {path}")
+    if catalog.get("code_sha256") != hashlib.sha256(code).hexdigest():
+        return frozenset()
+    return frozenset(int(site["pc"], 16) for site in catalog["sites"])
+
+
 def build_program(
     code: bytes,
     inventory_path: Path,
@@ -704,6 +734,7 @@ def build_program(
     *,
     base: int = DEFAULT_BASE,
     executable_size: int | None = None,
+    observed_sites: Iterable[int] = (),
 ) -> AotProgram:
     if executable_size is None:
         executable_size = len(code)
@@ -720,13 +751,37 @@ def build_program(
         (function.entry for function in callable_functions),
         flow_slots,
     )
+    # "Not an independent callable" does not mean "not executable". Audited
+    # switch cases retain the caller's registers and may use relative tables
+    # that the pointer-root pass cannot recognize (notably movie codecs).
+    # Seed only missing, explicitly classified internal cases, never data or
+    # arbitrary excluded intervals. Keep them distinct from public ABI roots.
+    with boundary_audit_path.open(newline="", encoding="utf-8-sig") as source:
+        internal_cases = {
+            int(row["entry"], 0)
+            for row in csv.DictReader(source)
+            if row.get("classification") == "switch_owned_case"
+        }
+    internal_cases -= flow.decoded_reachable | flow.unknown_stops
+    internal_cases &= flow_slots - literal_data
+    if internal_cases:
+        flow, literal_data, literal_sources, extra_iterations = pinned._address_aware_flow(
+            decoder, flow_slots,
+            (*[function.entry for function in callable_functions], *sorted(internal_cases)),
+            flow_slots,
+        )
+        iterations += extra_iterations
     reachable = flow.decoded_reachable | flow.unknown_stops
+    observed = frozenset(observed_sites)
+    if observed - flow.decoded_reachable:
+        missing = ", ".join(f"0x{pc:08X}" for pc in sorted(observed - flow.decoded_reachable))
+        raise ValueError(f"observed sites are not reachable code: {missing}")
     dynamic_targets = _switch_targets(decoder, literal_sources, reachable)
     blocks = _make_blocks(
         decoder,
         reachable,
-        flow.block_starts,
-        flow.explicit_lr_calls,
+        flow.block_starts | observed,
+        flow.explicit_lr_returns,
         dynamic_targets,
     )
     entry_to_block = {block.pc: block.index for block in blocks}
@@ -740,14 +795,16 @@ def build_program(
         for edge in block.successors
         if edge.kind == "direct_call" and edge.target in entry_to_block
     }
-    roots = set(inventory_by_entry) | set(flow.pointer_roots) | direct_targets
+    roots = set(inventory_by_entry) | set(flow.pointer_roots) | direct_targets | internal_cases
     roots &= set(entry_to_block)
-    blocks = _normalize_complementary_branch_chains(blocks, roots)
+    blocks = _normalize_complementary_branch_chains(blocks, roots | observed)
 
     def root_record(entry: int) -> tuple[int | None, str, str]:
         record = inventory_by_entry.get(entry)
         if record is not None:
             return record.end, record.name, "inventory"
+        if entry in internal_cases:
+            return None, f"internal_switch_{entry:08X}", "internal_dispatch"
         if entry in flow.pointer_roots:
             return None, f"address_taken_{entry:08X}", "address_taken"
         return None, f"direct_target_{entry:08X}", "direct_target"
@@ -882,7 +939,8 @@ def _cache_key(args: argparse.Namespace) -> str:
         UPSTREAM_SRC / "oot3d_pack/arm_decode.py",
         UPSTREAM_SRC / "oot3d_pack/arm_ir.py",
     )
-    for path in (*sources, args.code, args.inventory, args.boundary_audit):
+    for path in (*sources, args.code, args.inventory, args.boundary_audit,
+                 args.observed_sites):
         digest.update(str(path.resolve()).encode("utf-8"))
         digest.update(b"\0")
         digest.update(bytes.fromhex(_sha256_path(path)))
@@ -931,6 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--executable-size", type=lambda value: int(value, 0))
     parser.add_argument("--include-instructions", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--observed-sites", type=Path, default=DEFAULT_OBSERVED_SITES)
     return parser
 
 
@@ -956,6 +1015,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.boundary_audit,
         base=args.base,
         executable_size=args.executable_size,
+        observed_sites=load_observed_sites(args.observed_sites, code),
     )
     manifest = program.to_manifest(args.include_instructions)
     contents = (

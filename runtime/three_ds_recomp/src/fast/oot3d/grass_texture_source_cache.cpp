@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <fstream>
 
 namespace Fast::Oot3d {
 namespace {
@@ -37,9 +38,9 @@ uint64_t GrassTextureColorSource::ContentVersion() const noexcept {
     return hash == 0 ? 1 : hash;
 }
 
-uint32_t GrassTextureColorSource::SamplePacked(float u, float v,
-    GrassTextureWrap wrapS, GrassTextureWrap wrapT) const noexcept {
-    if (!Grid || !std::isfinite(u) || !std::isfinite(v)) return 0U;
+GrassTextureGridSample ResolveGrassTextureGridSample(
+    float u, float v, GrassTextureWrap wrapS, GrassTextureWrap wrapT) noexcept {
+    if (!std::isfinite(u) || !std::isfinite(v)) return {};
     constexpr int side = GrassTextureColorGrid::Side;
     const float x = WrapGrassTextureCoordinate(u, wrapS) * side - 0.5F;
     const float y = WrapGrassTextureCoordinate(v, wrapT) * side - 0.5F;
@@ -55,12 +56,12 @@ uint32_t GrassTextureColorSource::SamplePacked(float u, float v,
     };
     // Only four adjacent candidates are needed to find the nearest two in a
     // regular grid. Read RGB only for the two selected points.
-    struct Candidate { float DistanceSquared; int Index; };
+    struct Candidate { float DistanceSquared; int Index; std::array<int32_t, 2> Point; };
     std::array<Candidate, 4> candidates{};
     for (int i = 0; i < 4; ++i) {
         const int ix = x0 + (i & 1), iy = y0 + (i >> 1);
         candidates[i] = {(x - ix) * (x - ix) + (y - iy) * (y - iy),
-            index(iy, side, wrapT) * side + index(ix, side, wrapS)};
+            index(iy, side, wrapT) * side + index(ix, side, wrapS), {ix, iy}};
     }
     std::partial_sort(candidates.begin(), candidates.begin() + 2, candidates.end(),
         [](const auto& a, const auto& b) {
@@ -69,19 +70,57 @@ uint32_t GrassTextureColorSource::SamplePacked(float u, float v,
         });
     const float d0 = std::sqrt(candidates[0].DistanceSquared);
     const float d1 = std::sqrt(candidates[1].DistanceSquared);
-    const float weight1 = d0 == 0.0F ? 0.0F : d0 / (d0 + d1);
+    return {{candidates[0].Point, candidates[1].Point},
+        {static_cast<uint32_t>(candidates[0].Index), static_cast<uint32_t>(candidates[1].Index)},
+        d0 == 0.0F ? 0.0F : d0 / (d0 + d1), true};
+}
+
+std::array<float, 2> UnwrapGrassTextureGridPoint(
+    const std::array<int32_t, 2>& point, const std::array<float, 2>& uv,
+    GrassTextureWrap wrapS, GrassTextureWrap wrapT) noexcept {
+    std::array<float, 2> result{};
+    const std::array wraps{wrapS, wrapT};
+    for (size_t axis = 0; axis < 2; ++axis) {
+        const float center = (static_cast<float>(point[axis]) + 0.5F) / GrassTextureColorGrid::Side;
+        const float tile = std::floor(uv[axis]);
+        if (wraps[axis] == GrassTextureWrap::Clamp) result[axis] = center;
+        else if (wraps[axis] == GrassTextureWrap::Repeat) result[axis] = tile + center;
+        else result[axis] = tile + (std::fmod(std::abs(tile), 2.0F) >= 1.0F ? 1.0F - center : center);
+    }
+    return result;
+}
+
+uint32_t GrassTextureColorSource::SamplePacked(float u, float v,
+    GrassTextureWrap wrapS, GrassTextureWrap wrapT) const noexcept {
+    return Grid ? SamplePacked(ResolveGrassTextureGridSample(u, v, wrapS, wrapT)) : 0U;
+}
+
+uint32_t GrassTextureColorSource::SamplePacked(const GrassTextureGridSample& sample) const noexcept {
+    if (!Grid || !sample.Valid) return 0U;
     uint32_t packed = 0xff000000U;
     for (size_t c = 0; c < 3; ++c) {
-        const float value = std::lerp(Grid->Rgb[candidates[0].Index][c],
-            Grid->Rgb[candidates[1].Index][c], weight1);
+        const float value = std::lerp(Grid->Rgb[sample.Indices[0]][c],
+            Grid->Rgb[sample.Indices[1]][c], sample.Weight);
         packed |= static_cast<uint32_t>(std::clamp(std::lround(value), 0L, 255L)) << (8U * c);
     }
     return packed;
 }
 
+bool GrassTextureSourceCache::Contains(uint64_t hash) const {
+    std::scoped_lock lock(mMutex);
+    return mSources.contains(hash);
+}
+
 GrassTextureSourceCache& GrassTextureSourceCache::Instance() {
     static GrassTextureSourceCache cache;
     return cache;
+}
+
+void GrassTextureSourceCache::RecordDecodedAlias(
+    uint64_t alias, uint64_t nativeHash, uint64_t observation) const {
+    auto& entry = mDecodedToObserved[alias];
+    if (observation >= entry.LastObservation)
+        entry = {nativeHash, observation};
 }
 
 void GrassTextureSourceCache::ObserveDecoded(
@@ -90,12 +129,28 @@ void GrassTextureSourceCache::ObserveDecoded(
     if (rgba8Hash == 0 || rgba8.size() !=
             static_cast<size_t>(width) * height * 4U) return;
     std::scoped_lock lock(mMutex);
-    if (!mSources.contains(rgba8Hash)) {
+    const bool inserted = !mSources.contains(rgba8Hash);
+    if (inserted) {
         mSources.emplace(rgba8Hash, Source{width, height,
             std::make_shared<const std::vector<uint8_t>>(rgba8.begin(), rgba8.end())});
+        ++mGeneration;
     }
-    mDecodedToObserved.insert_or_assign(
-        AliasKey(Fnv1a64(rgba8), width, height), rgba8Hash);
+    auto& source = mSources.at(rgba8Hash);
+    const auto observation = ++mObservationSerial;
+    const uint32_t dimensions = (static_cast<uint32_t>(width) << 16U) | height;
+    if (!inserted && (source.Width != width || source.Height != height ||
+        !std::equal(rgba8.begin(), rgba8.end(), source.Rgba8->begin(), source.Rgba8->end()))) {
+        // Preserve aliases for alternate interpretations without replacing the
+        // original immutable mask/color source or retaining duplicate payloads.
+        RecordDecodedAlias(AliasKey(Fnv1a64(rgba8), width, height), rgba8Hash, observation);
+    } else {
+        source.LastObservation = observation;
+        if (mDecodedAliasDimensions.contains(dimensions)) {
+            if (!source.DecodedAliasKey)
+                source.DecodedAliasKey = AliasKey(Fnv1a64(rgba8), width, height);
+            RecordDecodedAlias(*source.DecodedAliasKey, rgba8Hash, observation);
+        }
+    }
     ExportTexturePreviewArtifact(
         rgba8Hash, width, height, rgba8);
 }
@@ -103,10 +158,29 @@ void GrassTextureSourceCache::ObserveDecoded(
 uint64_t GrassTextureSourceCache::ResolveObservedHash(
     uint64_t decodedRgba8Hash, uint16_t width, uint16_t height) const {
     std::scoped_lock lock(mMutex);
+    const uint32_t dimensions = (static_cast<uint32_t>(width) << 16U) | height;
+    if (!mDecodedAliasDimensions.contains(dimensions)) {
+        // Native rendering already has encoded-content identities. Build this
+        // compatibility index only on demand, in last-observation order.
+        std::vector<std::pair<uint64_t, uint64_t>> observed;
+        observed.reserve(mSources.size());
+        for (const auto& [nativeHash, source] : mSources) {
+            if (source.Width == width && source.Height == height)
+                observed.emplace_back(source.LastObservation, nativeHash);
+        }
+        std::sort(observed.begin(), observed.end());
+        for (const auto& [serial, nativeHash] : observed) {
+            const auto& source = mSources.at(nativeHash);
+            source.DecodedAliasKey = AliasKey(
+                Fnv1a64(*source.Rgba8), source.Width, source.Height);
+            RecordDecodedAlias(*source.DecodedAliasKey, nativeHash, serial);
+        }
+        mDecodedAliasDimensions.insert(dimensions);
+    }
     const auto found = mDecodedToObserved.find(
         AliasKey(decodedRgba8Hash, width, height));
     return found == mDecodedToObserved.end() ? decodedRgba8Hash
-                                             : found->second;
+                                             : found->second.NativeHash;
 }
 
 GrassScalarMask GrassTextureSourceCache::AcquireMask(
@@ -245,10 +319,52 @@ GrassTextureSourceCache::AcquireAverageColor(
     return found->second.AverageColor;
 }
 
+std::shared_ptr<const GrassTextureSignature> GrassTextureSourceCache::Find(
+    uint64_t rgba8Hash, bool persist) {
+    std::scoped_lock lock(mMutex);
+    const auto found = mSources.find(rgba8Hash);
+    if (found == mSources.end()) {
+        const auto stored = mStoredSignatures.find(rgba8Hash);
+        return stored == mStoredSignatures.end() ? nullptr : stored->second;
+    }
+    auto& source = found->second;
+    if (source.Signature == nullptr)
+        source.Signature = std::make_shared<const GrassTextureSignature>(
+            ComputeGrassTextureSignature(source.Width, source.Height, *source.Rgba8));
+    if (persist && !mSignatureStore.empty()) {
+        // Kept once; a changed payload under the same hash is not expected.
+        const auto [stored, added] = mStoredSignatures.try_emplace(rgba8Hash, source.Signature);
+        if (added) {
+            std::ofstream output(mSignatureStore, std::ios::binary | std::ios::app);
+            if (output) WriteGrassTextureSignature(output, rgba8Hash, *source.Signature);
+        }
+    }
+    return source.Signature;
+}
+
+uint64_t GrassTextureSourceCache::Generation() const {
+    std::scoped_lock lock(mMutex);
+    return mGeneration;
+}
+
+void GrassTextureSourceCache::SetSignatureStore(std::filesystem::path path) {
+    std::scoped_lock lock(mMutex);
+    mSignatureStore = std::move(path);
+    mStoredSignatures.clear();
+    if (std::ifstream input(mSignatureStore, std::ios::binary); input) {
+        for (auto& [hash, signature] : ReadGrassTextureSignatures(input))
+            mStoredSignatures[hash] = std::make_shared<const GrassTextureSignature>(signature);
+    }
+    ++mGeneration;
+}
+
 void GrassTextureSourceCache::Clear() {
     std::scoped_lock lock(mMutex);
+    ++mGeneration;
     mSources.clear();
     mDecodedToObserved.clear();
+    mObservationSerial = 0;
+    mDecodedAliasDimensions.clear();
 }
 
 } // namespace Fast::Oot3d

@@ -37,6 +37,11 @@ struct PicaShaderPipelineDrawInfo {
     ::Oot3d::Renderer::PicaCompositionDomain CompositionDomain =
         ::Oot3d::Renderer::PicaCompositionDomain::Unknown;
     ::Oot3d::Renderer::PicaCompareFunction DepthCompare = ::Oot3d::Renderer::PicaCompareFunction::Less;
+    Renderer3ds::PicaCompositionLayer CompositionLayer = Renderer3ds::PicaCompositionLayer::Unknown;
+    bool PointShadowReceiver = false;
+    // PicaCompositionAttribution::IsolatedLighting, in the full per-pixel
+    // model: the draw publishes no ambient occlusion response and no GI albedo.
+    bool IsolatedLighting = false;
 };
 
 struct PicaShaderPipelineRequest {
@@ -53,6 +58,11 @@ struct PicaShaderPipelineRequest {
     PicaShaderHookLayout FragmentShaderHooks;
     ::Oot3d::Renderer::PicaShaderSourceIdentity VertexShaderSourceIdentity;
     ::Oot3d::Renderer::PicaShaderSourceIdentity FragmentShaderSourceIdentity;
+    bool SurfaceLightingAvailable = false;
+    Renderer3ds::PicaPbrShaderOptions Pbr;
+    // The texture unit whose colour the draw's TEV passes to its output, when
+    // exactly one does (AO texture relief); 0xff otherwise.
+    uint8_t ReliefTexture = 0xffU;
 };
 
 struct PicaShaderPipelineResult {
@@ -70,6 +80,8 @@ struct PicaShaderPipelineResult {
     PicaToonEligibility ToonEligibility = PicaToonEligibility::Disabled;
     bool ToonMaterialPath = false;
     bool TemporalVertexApplied = false;
+    // The vertex program writes the authored surface normal and tint.
+    bool SurfaceVertexApplied = false;
     bool DirectTemporalVertexProgramUsed = false;
     PicaShaderHookLayout CanonicalFragmentHooks;
     bool DirectCanonicalFragmentHooksUsed = false;
@@ -85,9 +97,14 @@ struct PicaShaderPipelineResult {
         PicaReactiveCoverage::None;
     bool Reactive = false;
     bool RigidMotionApplied = false;
+    bool TypedNormalGuide = false;
     bool DirectFragmentHooksUsed = false;
     bool GrassTexture0Sampled = false;
     PicaFragmentInstrumentationOutputLayout FragmentOutputs;
+    // The fragment composition's branches (always-available programs).
+    PicaEffectDecisions Decisions;
+    // PicaFragmentInstrumentationResult::ReadsDrawControl.
+    bool ReadsDrawControl = false;
 
     [[nodiscard]] bool IsCanonical() const noexcept {
         return Domain == PicaShaderDomain::Canonical;
@@ -119,6 +136,17 @@ struct PicaShaderPipelineCacheStats {
 ResolvePicaShaderProfileFeatures(
     const EffectsSettings& effects, bool temporalMotionEnabled,
     bool directionalShadowLightingEnabled) noexcept;
+
+// Shared by offline program preparation and runtime selection. UI exclusion
+// and auxiliary-output eligibility must never diverge between these consumers.
+[[nodiscard]] PicaShaderInstrumentationFeature ResolvePicaDrawInstrumentationFeatures(
+    const PicaShaderPipelineRequest& request, const EffectsSettings& effects) noexcept;
+
+// OOT3D_GRAPHICS_FACE_NORMAL_GUIDE=1 (diagnostics) adds the face normal guide
+// to every guide-publishing variant. It is an input of variant generation that
+// settings do not carry: variant recordings store it, and corpus regeneration
+// and release qualification refuse it.
+[[nodiscard]] bool PicaFaceNormalGuideDiagnosticRequested() noexcept;
 
 // Owns two independent shader domains. Canonical entries are immutable copies
 // of the PICA frontend output and survive graphics-setting changes. Optional

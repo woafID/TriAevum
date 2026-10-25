@@ -1,5 +1,7 @@
 #pragma once
 
+#include "three_ds_motion_composition.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -325,16 +327,58 @@ struct DeviceDescriptor {
     std::string Name;
     bool HasGyroscope = false;
     bool HasAccelerometer = false;
+    std::string Serial;
+    bool Selected = false;
+    std::int32_t TouchpadCount = 0;
 };
+
+// Session IDs are never persisted. A GUID identifies a model; a serial, when
+// available, distinguishes two physical pads of that model.
+[[nodiscard]] std::string NormalizeControllerSerial(std::string_view serial);
+[[nodiscard]] bool MatchesController(const DeviceDescriptor& device,
+    std::string_view guid, std::string_view serial);
+[[nodiscard]] std::int32_t SelectControllerDevice(
+    std::span<const DeviceDescriptor> devices, std::string_view guid,
+    std::string_view serial, std::int32_t previousInstance = -1);
 
 struct MotionObservation {
     std::array<float, 3> GyroscopeDegreesPerSecond{};
     std::array<float, 3> Accelerometer{0.0F, -1.0F, 0.0F};
     bool GyroscopeValid = false;
     bool AccelerometerValid = false;
+    std::uint64_t GyroscopeTimestampMicroseconds = 0;
+    std::uint64_t AccelerometerTimestampMicroseconds = 0;
+};
+
+// Azahar's SDL -> native 3DS orientation and units, independent of pad brand.
+[[nodiscard]] MotionObservation ConvertSdlMotion(
+    const std::array<float, 3>& accelerationMetersPerSecondSquared, bool accelerationValid,
+    const std::array<float, 3>& gyroscopeRadiansPerSecond, bool gyroscopeValid) noexcept;
+
+class MotionCalibrationAccumulator {
+public:
+    void Reset() noexcept;
+    bool Observe(const MotionObservation& observation) noexcept;
+    [[nodiscard]] std::uint32_t SamplesCollected() const noexcept;
+    [[nodiscard]] MotionObservation Mean() const noexcept;
+    [[nodiscard]] bool WaitingForStillness() const noexcept { return mWaitingForStillness; }
+    static constexpr std::uint32_t SamplesRequired = 60;
+private:
+    std::array<double, 3> mGyroscopeSum{}, mAccelerometerSum{};
+    std::uint32_t mGyroscopeCount = 0, mAccelerometerCount = 0;
+    std::uint64_t mGyroscopeTimestamp = 0, mAccelerometerTimestamp = 0;
+    bool mWaitingForStillness = false;
+};
+
+struct NormalizedTouch {
+    float X = 0.0F;
+    float Y = 0.0F;
+    bool Pressed = false;
 };
 
 struct PhysicalInputState {
+    std::uint32_t ControllerButtons = 0;
+    std::uint32_t ControllerPressed = 0;
     std::int16_t LeftStickX = 0;
     std::int16_t LeftStickY = 0;
     std::int16_t RightStickX = 0;
@@ -343,6 +387,7 @@ struct PhysicalInputState {
     std::int32_t MouseDeltaY = 0;
     double SamplePeriodSeconds = 1.0 / 60.0;
     MotionObservation ControllerMotion;
+    NormalizedTouch ControllerTouch;
 };
 
 struct MappingConfig {
@@ -356,7 +401,6 @@ struct MappingConfig {
     float CStickMotionMaximumDegreesPerSecond = 180.0F;
     float ControllerGyroscopeSensitivity = 1.0F;
     float ControllerAccelerometerSensitivity = 1.0F;
-    float CStickSensorSensitivity = 1.0F;
     bool NativeMotionInvertX = false;
     bool NativeMotionInvertY = false;
     std::array<float, 3> GyroscopeBiasDegreesPerSecond{};
@@ -381,8 +425,16 @@ struct CStickFilterState {
 struct VirtualMotionState {
     double PitchRadians = 0.0;
     bool Active = false;
+    enum class Owner { None, Mouse, Controller };
+    Owner AutomaticOwner = Owner::None;
+    std::uint32_t PreviousControllerButtons = 0;
+    MotionCompositionState Composition;
+    void ResetController() noexcept;
     void RestoreGravity(const std::array<float, 3>& gravity) noexcept;
 };
+
+// Host presentation can poll several times before the guest consumes input.
+double ConsumeInputPeriod(double pollSeconds, bool consume, double& pendingSeconds) noexcept;
 
 enum class AxisInputKind : std::uint8_t {
     Absolute,
@@ -408,12 +460,17 @@ struct HidState {
     bool GyroscopeValid = false;
 };
 
+// Camera control never consumes motion sensors, including legacy profiles.
+[[nodiscard]] MotionSource NormalizeCameraSource(MotionSource source) noexcept;
+
 struct TouchMapping {
     std::uint16_t X = 0;
     std::uint16_t Y = 0;
     bool Inside = false;
     bool Pressed = false;
 };
+
+[[nodiscard]] TouchMapping MapNormalizedTouch(const NormalizedTouch& touch) noexcept;
 
 [[nodiscard]] TouchMapping MapPresentationPointToTouch(
     float pointX, float pointY, float presentationWidth,

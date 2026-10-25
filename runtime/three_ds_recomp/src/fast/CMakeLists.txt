@@ -51,6 +51,7 @@ target_sources(three_ds_recomp_runtime PRIVATE ${Source_Files__Graphic})
 
 set(Source_Files__RendererExtensions
     renderer/cache_file.cpp
+    renderer/gtao_shader.cpp
     renderer/spirv_cache.cpp
     renderer/pipeline_preparation_job.cpp
     renderer/extension_resource_allocation.cpp
@@ -81,6 +82,17 @@ set(Source_Files__Renderer3dsPica
     renderer3ds/pica_gl_shader_dialect.cpp
     renderer3ds/pica_scene_capabilities.cpp
     renderer3ds/pica_semantic_scene_view.cpp
+    renderer3ds/pica_vertex_surface.cpp
+    renderer3ds/pica_surface_lighting.cpp
+    renderer3ds/pica_surface_emission.cpp
+    renderer3ds/pica_pbr_shading.cpp
+    renderer3ds/pica_pbr_seams.cpp
+    renderer3ds/pica_pbr_seam_shader.cpp
+    renderer3ds/room_shadow_shell.cpp
+    renderer3ds/virtual_shadow_map.cpp
+    renderer3ds/point_shadow_map.cpp
+    renderer3ds/pica_shadow_geometry.cpp
+    renderer3ds/pica_gi_geometry.cpp
 )
 add_library(renderer_3ds_pica_core STATIC
     ${Source_Files__Renderer3dsPica})
@@ -89,6 +101,7 @@ add_library(ThreeDsRecomp::Renderer3dsPicaCore ALIAS
 set_property(TARGET renderer_3ds_pica_core PROPERTY CXX_STANDARD 20)
 target_include_directories(renderer_3ds_pica_core PUBLIC ${INCLUDE_DIR})
 target_link_libraries(renderer_3ds_pica_core PUBLIC
+    ThreeDsRecomp::TevProgram
     ThreeDsRecomp::RendererExtensionCore)
 get_target_property(renderer_3ds_pica_core_direct_links
     renderer_3ds_pica_core LINK_LIBRARIES)
@@ -113,7 +126,9 @@ source_group("renderer3ds" FILES ${Source_Files__Renderer3dsPica})
 if(THREE_DS_RECOMP_ENABLE_VULKAN)
     set(Source_Files__Renderer3dsNriPica
         renderer3ds/nri_pica_pipeline_bridge.cpp
+        renderer3ds/pica_preparation_queue.cpp
         renderer3ds/vulkan_pipeline_cache_store.cpp
+        renderer3ds/vulkan_memory_budget.cpp
         renderer3ds/nri_pica_upload_arena.cpp
         renderer3ds/pica_nri_shader_contract.cpp
         renderer3ds/pica_nri_upload.cpp
@@ -151,6 +166,8 @@ file(GLOB Source_Files__Oot3dRenderer CONFIGURE_DEPENDS
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "oot3d/*.cpp")
 list(FILTER Source_Files__Oot3dRenderer EXCLUDE REGEX
     "^oot3d/(pica_texture_decode|pica_fragment_lighting)\\.cpp$")
+# SPIR-V pack sources are added with their packs (src/CMakeLists.txt).
+list(FILTER Source_Files__Oot3dRenderer EXCLUDE REGEX "^oot3d/.*_binaries\\.cpp$")
 if(NOT THREE_DS_RECOMP_ENABLE_VULKAN)
     # This translation unit is Vulkan-only and deliberately has no stub
     # implementation.  Keep Vulkan headers out of OpenGL-only ports such as
@@ -158,6 +175,7 @@ if(NOT THREE_DS_RECOMP_ENABLE_VULKAN)
     list(REMOVE_ITEM Source_Files__Oot3dRenderer
         "oot3d/pica_nri_pipeline_state.cpp"
         "oot3d/pica_pipeline_preparation.cpp"
+        "oot3d/pica_builtin_fragment_families.cpp"
         "oot3d/pica_guide_sampling_barriers.cpp")
 endif()
 source_group("oot3d" FILES ${Source_Files__Oot3dRenderer})

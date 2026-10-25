@@ -37,6 +37,9 @@ HMODULE TitleModule() noexcept {
         const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
         if (length == 0 || length == 32768) return nullptr;
         path = std::filesystem::path(executable).parent_path() / L"triaevum_title_aot.dll";
+        // The Windows package keeps its DLLs in runtime/ beside TriAevum.exe.
+        if (std::error_code error; !std::filesystem::is_regular_file(path, error))
+          path = path.parent_path() / L"runtime" / L"triaevum_title_aot.dll";
       }
       return LoadLibraryExW(path.c_str(), nullptr,
           LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -91,6 +94,7 @@ const Oot3dWholeAotProgramV2 *WholeAotProgram() noexcept {
     if (candidate == nullptr ||
         candidate->AbiVersion != kOot3dWholeAotPluginAbiV2 ||
         candidate->StructSize < sizeof(Oot3dWholeAotProgramV2) ||
+        candidate->MemoryWriteObservationVersion != NativeA32Memory::WriteObservationAbiVersion() ||
         candidate->EntryPoints == nullptr || candidate->EntryPointCount == 0U ||
         candidate->Execute == nullptr || candidate->ExecutionActive == nullptr ||
         candidate->ObservableExit == nullptr) {
@@ -218,6 +222,13 @@ void ConfigureTitlePlugin(const std::filesystem::path& path) {
 
 bool Oot3dWholeAotPluginV2Available() noexcept {
   return WholeAotProgram() != nullptr;
+}
+
+bool Oot3dWholeAotPluginObservesMemoryWrites() noexcept {
+  const auto* program = WholeAotProgram();
+  if (program == nullptr) return DirectAotProgram() != nullptr;
+  return program->StructSize >= sizeof(Oot3dWholeAotProgramV2) &&
+         program->MemoryWriteObservationVersion == NativeA32Memory::WriteObservationAbiVersion();
 }
 
 bool Oot3dWholeAotPluginExecutionActive() noexcept {

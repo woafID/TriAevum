@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import forge
 import forge_gui
-from common import atomic_write_json, sha256_file
+from common import atomic_write_json, load_json_object, sha256_file
 from installed_runtime import validate_installed_runtime
 from activation_transaction import journal_path
 from release_platform import host_platform, LINUX, WINDOWS
@@ -17,7 +17,7 @@ class InstalledRuntimeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.exe = self.root / host_platform().runtime
+        self.exe = self.root / host_platform().installed_runtime
         self.exe.write_bytes(b"host")
         self.plugin = self.root / host_platform().title_module
         self.plugin.write_bytes(b"title")
@@ -74,7 +74,7 @@ class InstalledRuntimeTests(unittest.TestCase):
     def test_launcher_uses_selected_data_and_validated_profile(self):
         active = SimpleNamespace(directory=self.title)
         prepared = SimpleNamespace(state={"runtime": self.receipt})
-        with (patch("forge_gui.runtime_path", return_value=self.exe),
+        with (patch("forge_gui.installation_root", return_value=self.root),
               patch("forge_gui.load_active_title", return_value=active) as load,
               patch("forge_gui.forge.load_prepared_content", return_value=prepared),
               patch("forge_gui.subprocess.Popen") as launch):
@@ -109,7 +109,7 @@ class InstalledRuntimeTests(unittest.TestCase):
         from installation_context import expand_profile_argument
         package = self.root / "immutable package"
         package.mkdir()
-        executable = package / host_platform().runtime
+        executable = package / host_platform().installed_runtime
         executable.write_bytes(b"read-only runtime")
         incoming = package / host_platform().title_module
         incoming.write_bytes(b"read-only title")
@@ -139,7 +139,7 @@ class InstalledRuntimeTests(unittest.TestCase):
                 self.assertTrue(all(call.args[0] == executable for call in query.call_args_list))
         finally:
             package.chmod(old_mode)
-        arguments = [expand_profile_argument(arg, profile) for arg in load_json_object(profile)["arguments"]]
+        arguments = [expand_profile_argument(arg, profile, package) for arg in load_json_object(profile)["arguments"]]
         self.assertEqual(Path(arguments[arguments.index("--resource-root") + 1]), package / "resources")
         self.assertEqual({p.name: p.read_bytes() for p in package.iterdir()}, before)
         self.assertEqual(marker.read_bytes(), b"existing save")
@@ -163,9 +163,46 @@ class InstalledRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TopScreen textures changed"):
             self.validate()
 
+    def test_water_texture_catalog_is_published_and_verified_with_launch_profile(self):
+        catalog = self.data / "cache/water/key/water_textures.txt"
+        catalog.parent.mkdir(parents=True)
+        catalog.write_bytes(b"triaevum-water-textures 1\n")
+        prepared = SimpleNamespace(directory=self.title, state={})
+        with (patch("forge.load_prepared_content", return_value=prepared),
+              patch("forge.ensure_runtime_config"),
+              patch("forge.query_product", return_value={
+                  "product": {}, "runtime_sha256": sha256_file(self.exe)})):
+            forge.publish_private_runtime(
+                self.title, plugin=self.plugin, runtime_plugin=self.plugin,
+                launch_profile=self.profile, data_root=self.data, water_texture_catalog=catalog)
+        self.receipt = prepared.state["runtime"]
+        self.assertEqual(self.validate(), self.profile)
+        catalog.write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "water texture catalog changed"):
+            self.validate()
+
+    def test_scene_light_catalog_is_published_and_verified_with_launch_profile(self):
+        catalog = self.data / "cache/scene-lights/key/scene_lights.json"
+        catalog.parent.mkdir(parents=True)
+        catalog.write_bytes(b'{"schema":"triaevum.scene-lights","version":1,"rooms":[]}')
+        prepared = SimpleNamespace(directory=self.title, state={})
+        with (patch("forge.load_prepared_content", return_value=prepared),
+              patch("forge.ensure_runtime_config"),
+              patch("forge.query_product", return_value={
+                  "product": {}, "runtime_sha256": sha256_file(self.exe)})):
+            forge.publish_private_runtime(
+                self.title, plugin=self.plugin, runtime_plugin=self.plugin,
+                launch_profile=self.profile, data_root=self.data, scene_light_catalog=catalog)
+        self.receipt = prepared.state["runtime"]
+        self.assertEqual(self.validate(), self.profile)
+        self.assertIn("--scene-light-catalog", load_json_object(self.profile)["arguments"])
+        catalog.write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "scene light catalog changed"):
+            self.validate()
+
     def test_launcher_refuses_pending_activation_before_loading_title(self):
         atomic_write_json(journal_path(self.root), {})
-        with (patch("forge_gui.runtime_path", return_value=self.exe),
+        with (patch("forge_gui.installation_root", return_value=self.root),
               patch("forge_gui.load_active_title") as load,
               patch("forge_gui.subprocess.Popen") as launch):
             with self.assertRaisesRegex(forge.ForgeError, "interrupted"):

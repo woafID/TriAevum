@@ -101,7 +101,7 @@ Representative evidence and analysis are in
 `I:/oot3dre_work/shader-seed-expansion/representatives/`,
 `representatives-inventory.json`, `representatives-analysis.json` and
 `representatives-compile.json` in the parent directory. Larger temporal capture
-outputs use `C:/Users/xander/AppData/Local/TriAevumDeveloperEvidence/shader-seed-expansion/`
+outputs use `%USERPROFILE%/AppData/Local/TriAevumDeveloperEvidence/shader-seed-expansion/`
 to avoid exhausting I:. These remain private development artifacts.
 
 The representative campaign exposed a Windows checkpoint sharing-lock error.
@@ -146,7 +146,7 @@ its scene and yielding valid draws is not proof that its whole named cutscene
 or boss sequence played. Wall-time samples do not prove animation-frame timing.
 
 Private final artifacts, under
-`C:/Users/xander/AppData/Local/TriAevumDeveloperEvidence/shader-seed-expansion/`:
+`%USERPROFILE%/AppData/Local/TriAevumDeveloperEvidence/shader-seed-expansion/`:
 
 - `setup-variants/coverage_matrix.json`: all 110 results and capture windows.
 - `combined/corpus.json`: merged relocatable corpus and original provenance.
@@ -160,7 +160,7 @@ Private final artifacts, under
 
 Final pack SHA-256:
 `1f2a776aea6d84290d87644884867422d62ad24a740f947658ca52b0fb7a296d`.
-Native tools used `/home/xander/triaevum-android-build/expanded-combined/` on
+Native tools used `~/triaevum-android-build/expanded-combined/` on
 the Linux development host; no game, whole-AOT or Android build was required.
 
 Source milestones: `8af5834` introduced native capture ingestion; `17d6566`
@@ -260,6 +260,121 @@ different timing or gameplay state can change which transient draws occur.
 Capture scheduling and checkpoint I/O have isolated PowerShell tests:
 `Test-Oot3dAzaharCaptureSchedule.ps1` and `Test-Oot3dCoverageCheckpoint.ps1`.
 
+## Regeneration with the current runtime (2026-10-07)
+
+The pack's modules are keyed by generated source text, so every change to the
+PICA lowering, the NRI variants or the surface lighting leaves an older pack
+unresolved (Windows qualification A8: the 2026-09-10 pack resolved 0 of 29
+programs of the Kokiri quick save). The private inputs are raw PICA state and
+stay valid; `tools/triaevum_release/regenerate_shader_corpus.py` re-imports
+them with the importers built from the runtime's own source, writes the
+observed pipeline manifest, compiles the union and records a receipt:
+
+```text
+python tools/triaevum_release/regenerate_shader_corpus.py --tools BUILD \
+  --capture-corpus PRIVATE/combined/corpus.json \
+  --citra-cache PRIVATE/0004000000033500.bin --citra-cache PRIVATE/transferable-final.bin \
+  --output NEW_PRIVATE_DIRECTORY
+```
+
+Graphics profiles add `--variant-records DIR` (repeatable, searched
+recursively). Each recorded session directory holds `raw-draws.jsonl`
+(`OOT3D_PICA_RAW_DRAWS`), `variant-requests.jsonl`
+(`OOT3D_PICA_VARIANT_REQUESTS`) and `session-pipelines.json`
+(`OOT3D_PICA_PIPELINE_INVENTORY`). `oot3d_native_pica_variant_inventory`
+rebuilds every request with this build's generators and the real variant
+cache, fails when an output differs from the recorded witness, and rewrites
+the recipes into `runtime-pipelines.json`, the profile recipes for device
+preparation (see `TRIAEVUM_NRI_PIPELINE_PREPARATION.md`, Graphics Profile
+Coverage). Recorded shader text (`*-shaders.json`) is no longer an input: it
+went stale with every generator change (issue #76).
+
+`oot3d_native_pica_variant_inventory --infer-report OUT` is a dry run of
+inferred coverage: every recorded request is resolved again with one per-draw
+semantic changed at a time (surface availability, directional and point shadow
+receivers, isolated lighting, temporal motion, relief, reflection) and the
+report counts the modules not already observed. It never adds to the corpus.
+On the Kokiri rain session (126 observed modules, 16.3 MB of source) it found
+221 more modules (9.0 MB), temporal motion the largest; widening is a budgeted
+decision (+25 % of pack bytes and preparation time), not a default.
+
+The AOT compiler runs up to 8 workers (`--jobs`) and, with `--compile-cache
+DIR`, reuses a module compiled earlier for the same source, stage, compiler
+build and options; a regeneration that changes a few programs recompiles only
+those. On 2026-10-16 (1066 modules) the union took 48 s serially, 13 s with 8
+workers and under 1 s from a warm cache, with byte-identical packs.
+
+Alpha-tested shadow casters run their draw's fragment program up to the native
+alpha test. A program with a parametric (always-available) form uses the
+built-in caster family (`build_fragment_artifacts --casters`); any other is
+title-derived, so the replay adds its caster as an NRI fragment of the corpus
+and the pass compiler finds it in the pack (`TRIAEVUM_BUILTIN_PASS_ARTIFACTS
+title_hits`) instead of compiling it.
+
+A recorded session also holds `runtime-inputs.json`, written right after the
+recording by `shader_corpus_qualification.py record-inputs --build BUILD
+--target TriAevum`. Three gates keep a stale corpus out of a release:
+
+1. Freshness (CPU, seconds). Regeneration writes `qualification.json`: every
+   repository file the generating tools were compiled from (sources, headers,
+   embedded data, from the Ninja graph) and, of each recording runtime's
+   inputs, the decision-policy subset: the files the generator shares with
+   the runtime (shader text, identity, settings and semantics types) and the
+   runtime modules that compose a draw's variant request (the Vulkan PICA
+   draw path, PICA scene semantics and composition, effect, settings and
+   reflection policies, the PICA frontend; `POLICY_PATTERNS` in
+   `shader_corpus_qualification.py`, listed for a session by its
+   `policy-inputs` command), with SHA-256s. `prepare_release.py
+   --shader-qualification` refuses the corpus when a generator input changed
+   (regenerate) or a policy input changed (record again), and when the pack
+   or recipes are not the qualified ones. The release audit repeats the check
+   against the corresponding source archive in the package. Both
+   over-invalidate within their set: any change to a listed file counts.
+   Runtime files outside the set (window, input, audio, UI, game logic, GPU
+   memory and upload management, pipeline caches) cannot change a request, so
+   a release runtime that differs from the recording runtime only there keeps
+   the recordings, the regeneration and the gate 3 result: the release work
+   after a freeze stays offline.
+2. Closure (CPU, during regeneration). Every replayed module and every recipe's
+   module must be in the compiled pack.
+3. Shipped artifacts (GPU). `qualify_shader_handoff.py --package PACKAGE
+   --release` prepares the packaged corpus into an empty data directory as
+   Forge does, launches twice and requires no PICA or pass compilation, no
+   shaderc call (`TRIAEVUM_SHADERC_AUDIT`), no pack miss (also per unique
+   identity) and a non-zero instrumented program count.
+
+It accepts a transferable cache's partial import (exit 3) only when its sole
+gap is the documented unimported vertex/geometry records. The in-repo boot
+profile (`profiles/oot3d_pica_boot_title_kokiri_effective.json`) is generated
+source, not raw state, and is not part of the union; the captures cover the
+title and Kokiri Forest.
+
+The first run found an identity defect: since `58b1cd13` a specialized fragment
+program leaves Z-buffered depth with scale -1 and offset 0 to fixed function,
+and its shader state key records that, but the canonical fragment program id
+did not. Two draws of `spot00_info_setup_10_entry_00cd` (draws 4 and 18) then
+shared pipeline `0x751ad6609e8a6176` with two fragment sources, and the importer
+stopped ("native pipeline/source identity collision"). The fragment program id
+now includes that choice (only when it holds, so other identities are
+unchanged); the collision message names both draws.
+
+| Measurement (Windows, 2026-10-07, HEAD `6ba1aeb` + the fix) | Result |
+| --- | --- |
+| Capture corpus re-import | 126,612/126,612 complete draws, 0 failures, 513 modules, 732 native recipes (709 before the split), 521 host pipeline recipes, 116 s |
+| Citra seed cache | 426 records, complete, 718 unique modules |
+| TAS cache | 392 of 393 records (1 vertex record not imported), 688 unique modules |
+| Union pack | 989 modules, schema 3, 8,263,460 bytes, compiled in 12.5 s |
+| Kokiri quick save, qualification configuration (Custom, per-pixel PBR) | 18 hits / 11 misses (old pack: 0 / 29) |
+| Same, Authentic preset | 18 hits / 0 misses |
+
+The 11 remaining misses are NRI fragment programs the renderer composes with
+the user's effects (surface lighting, PBR): they depend on graphics settings,
+not on captured state, and compile in the background (hybrid preparation), as
+with the freshly built September pack (54 hits / 32 misses on its first replay).
+Private output: `I:/oot3dre_work/shader-corpus-20261007/` (`regeneration.json`,
+`expanded-union.o3ps` SHA-256 `55b954304f7b13fe621f1843b43faeff79a5e939d27c3a646d8762eeb9c927ae`,
+`captures-0-pipelines.json`). Regenerate again with the release runtime.
+
 ## Remaining Work
 
 - Representatives and setup variants are collected. Further collection should
@@ -291,9 +406,9 @@ Capture scheduling and checkpoint I/O have isolated PowerShell tests:
   `combined-inventory.json`, `scenario-union-compile.json`, `scenario-union.o3ps`).
 - Historical matrices: `I:/oot3dre_work/azahar-coverage-matrices/`,
   `smoke_full_20260825_2300` and `scene_representative_sample_5_20260825`.
-- Linux importer/tests: `/home/xander/triaevum-android-build/capture-importer`
+- Linux importer/tests: `~/triaevum-android-build/capture-importer`
   and `capture-tests`; compiler:
-  `/home/xander/triaevum-linux-build/oot3d_native_pica_aot_compiler`.
+  `~/triaevum-linux-build/oot3d_native_pica_aot_compiler`.
 - Instrumented Azahar: `I:/oot3dre_work/azahar-oot3d-coverage`, branch
   `oot3d-coverage-injection`, commit `23d77c2d4`, based on `1833641d5`.
   The reproducible source-only delta is

@@ -1,6 +1,9 @@
 #include "oot3d_native_pica_vulkan_plan.h"
+#include "oot3d_cpu_phase_probe.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -75,6 +78,11 @@ bool ResolveTextureContentIdentity(
     if (bytes.empty()) {
         SetError(error, "native PICA texture identity has no payload");
         return false;
+    }
+    if (!texture.CopyReferences.empty()) {
+        texture.NativeContentHash = texture.NativeBaseLevelContentHash = 0U;
+        texture.NativeContentHashAvailable = texture.NativeBaseLevelContentHashAvailable = false;
+        return true;
     }
     if (!texture.NativeContentHashAvailable) {
         texture.NativeContentHash = HashGeometryBytes(bytes);
@@ -237,7 +245,7 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
     } else {
         if (!GenerateOot3dPicaVertexShader(
                 submission.Packet, submission.State, plan.VertexShader,
-                error)) {
+                error, shaderCache && shaderCache->TevMode == Oot3dPicaTevMode::Parametric)) {
             return false;
         }
         if (shaderCache != nullptr) {
@@ -258,7 +266,7 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
 
     const uint64_t fragmentShaderKey =
         ComputeOot3dPicaFragmentShaderStateKey(submission.Packet,
-                                               submission.State);
+            submission.State, shaderCache ? shaderCache->TevMode : Oot3dPicaTevMode::Specialized);
     const auto cachedFragment =
         shaderCache != nullptr
             ? shaderCache->FragmentSources.find(fragmentShaderKey)
@@ -279,7 +287,8 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
     } else {
         if (!GenerateOot3dPicaFragmentShader(
                 submission.Packet, submission.State, plan.FragmentShader,
-                error)) {
+                error, Oot3dPicaShaderBuildPurpose::RuntimeDraw,
+                shaderCache ? shaderCache->TevMode : Oot3dPicaTevMode::Specialized)) {
             return false;
         }
         if (shaderCache != nullptr) {
@@ -297,12 +306,50 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
             ++shaderCache->FragmentMisses;
         }
     }
+    if (shaderCache != nullptr && shaderCache->UberFragments) {
+        auto uber = shaderCache->UberFragmentsBySpecializedKey.find(
+            fragmentShaderKey);
+        if (uber == shaderCache->UberFragmentsBySpecializedKey.end()) {
+            Oot3dPicaVulkanCachedUberFragment entry;
+            Oot3dPicaGeneratedFragmentShader generated;
+            // A draw the parametric program cannot express keeps only its
+            // specialized program; that is reported by the backend.
+            std::string uberError;
+            entry.Available = GenerateOot3dPicaFragmentShader(
+                submission.Packet, submission.State, generated, &uberError,
+                Oot3dPicaShaderBuildPurpose::RuntimeDraw,
+                Oot3dPicaTevMode::Parametric);
+            static const bool diagnostics = [] {
+                const char* value = std::getenv("TRIAEVUM_UBER_DIAGNOSTICS");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (!entry.Available && diagnostics)
+                std::fprintf(stderr, "TRIAEVUM_UBER_NO_PARAMETRIC key=%016llx error=%s\n",
+                             static_cast<unsigned long long>(fragmentShaderKey), uberError.c_str());
+            if (entry.Available) {
+                entry.StateKey = generated.StateKey;
+                entry.Identity = generated.SourceIdentity;
+                entry.Hooks = generated.Hooks;
+                entry.Source = std::make_shared<const std::string>(
+                    std::move(generated.Source));
+            }
+            uber = shaderCache->UberFragmentsBySpecializedKey.emplace(
+                fragmentShaderKey, std::move(entry)).first;
+        }
+        if (uber->second.Available) {
+            plan.UberFragmentShader.StateKey = uber->second.StateKey;
+            plan.UberFragmentShader.SourceIdentity = uber->second.Identity;
+            plan.UberFragmentShader.Hooks = uber->second.Hooks;
+            plan.SharedUberFragmentShaderSource = uber->second.Source;
+        }
+    }
 
     plan.SubmissionId = submission.Id;
     plan.CommandListAddress = submission.Packet.CommandListAddress;
     plan.CommandListOffsetWords = submission.Packet.CommandListOffsetWords;
     plan.CompositionDomain = submission.Packet.CompositionDomain;
     plan.Composition = submission.Packet.Composition;
+    plan.LightBinding = submission.Packet.LightBinding;
     plan.LightingLuts = submission.Packet.LightingLuts;
     plan.State = submission.State;
     plan.Indexed = submission.State.VertexInput.Indexed;
@@ -493,6 +540,10 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
         Oot3dPicaVulkanTextureBinding textureBinding{
             static_cast<uint8_t>(texture),
             submission.State.Textures[texture], {}};
+        if (resource->ReplacementWidth && resource->ReplacementHeight) {
+            textureBinding.State.Width = resource->ReplacementWidth;
+            textureBinding.State.Height = resource->ReplacementHeight;
+        }
         if (resource->SharedBytes != nullptr) {
             if constexpr (ConsumeResources) {
                 textureBinding.SharedNativeBytes =
@@ -510,6 +561,12 @@ bool BuildOot3dPicaVulkanDrawPlanImpl(
             resource->ContentHashAvailable;
         textureBinding.NativeBaseLevelContentHash = resource->BaseLevelContentHash;
         textureBinding.NativeBaseLevelContentHashAvailable = resource->BaseLevelContentHashAvailable;
+        if constexpr (ConsumeResources) {
+            textureBinding.CopyReferences =
+                std::move(resource->CopyReferences);
+        } else {
+            textureBinding.CopyReferences = resource->CopyReferences;
+        }
         if (!ResolveTextureContentIdentity(textureBinding, error)) {
             return false;
         }
@@ -571,8 +628,49 @@ bool BuildOot3dPicaVulkanDrawPlanAndConsumeResources(
     Oot3dPicaDrawSubmission& submission,
     Oot3dPicaVulkanDrawPlan& plan, std::string* error,
     Oot3dPicaVulkanShaderSourceCache* shaderCache) {
+    CpuPhaseProbe::Scope cpuPlan(CpuPhaseProbe::Phase::PicaPlan);
     return BuildOot3dPicaVulkanDrawPlanImpl<true>(
         submission, plan, error, shaderCache);
+}
+
+void AttachOot3dPicaRestoredUberFragment(Oot3dPicaVulkanDrawPlan& plan) {
+    struct Base {
+        std::shared_ptr<const std::string> Source;
+        uint64_t StateKey = 0;
+        Oot3d::Renderer::PicaShaderSourceIdentity Identity;
+        Oot3d::Renderer::PicaShaderHookLayout Hooks;
+    };
+    // Six immutable programs (lighting x integer texture 0), generated once
+    // on first use.
+    constexpr size_t kLightings = std::size(kOot3dPicaParametricLightings);
+    static const std::array<Base, kLightings * 2U> bases = [] {
+        std::array<Base, kLightings * 2U> result;
+        for (unsigned index = 0; index < result.size(); ++index) {
+            Oot3dPicaGeneratedFragmentShader generated;
+            if (!GenerateOot3dPicaParametricBaseFragmentShader(kOot3dPicaParametricLightings[index % kLightings],
+                                                               index >= kLightings, generated))
+                continue;
+            result[index].StateKey = generated.StateKey;
+            result[index].Identity = generated.SourceIdentity;
+            result[index].Hooks = generated.Hooks;
+            result[index].Source = std::make_shared<const std::string>(std::move(generated.Source));
+        }
+        return result;
+    }();
+    if (plan.State.OutputMerger.FragmentOperationMode == 3U) return;
+    const bool integerTexture0 = plan.State.Textures[0].Type == 2U && plan.State.Textures[0].Enabled;
+    // The specialized program binds the lookup tables under the same rule
+    // (the restored plan keeps no lighting registers).
+    const auto lighting = !plan.FragmentFeatures.FragmentLightingEnabled ? Oot3dPicaParametricLighting::Off
+        : plan.ResolvedFragmentShaderSource().find("usampler2D pica_lighting_lut;") != std::string_view::npos
+            ? Oot3dPicaParametricLighting::LookupTables
+            : Oot3dPicaParametricLighting::NoLookupTables;
+    const auto& base = bases[static_cast<size_t>(lighting) + (integerTexture0 ? kLightings : 0U)];
+    if (base.Source == nullptr) return;
+    plan.UberFragmentShader.StateKey = base.StateKey;
+    plan.UberFragmentShader.SourceIdentity = base.Identity;
+    plan.UberFragmentShader.Hooks = base.Hooks;
+    plan.SharedUberFragmentShaderSource = base.Source;
 }
 
 bool BuildOot3dPicaVulkanPipelinePlan(

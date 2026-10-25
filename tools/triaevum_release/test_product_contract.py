@@ -19,7 +19,7 @@ def fixture_product():
         "private_title_loaded": False,
         "capabilities": {"nri": True, "f1": True, "topscreen": True},
         "default_config": {"Graphics": {
-            "Preset": "Custom", "FrameRate": {"Mode": "Interpolated2x"},
+            "Preset": "Enhanced", "FrameRate": {"Mode": "Interpolated2x"},
         }},
     }
 
@@ -34,6 +34,10 @@ class ProductContractTests(unittest.TestCase):
                 validate_product_info(info)
         with self.assertRaisesRegex(ValueError, "commit"):
             validate_product_info(fixture_product(), "b" * 40)
+        info = fixture_product()
+        info["default_config"]["Graphics"]["Preset"] = "Custom"
+        with self.assertRaisesRegex(ValueError, "Enhanced"):
+            validate_product_info(info)
 
     def test_initializes_x2_only_for_new_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +96,22 @@ class ProductContractTests(unittest.TestCase):
                 self.assertEqual(log["operation"], "product-info")
                 self.assertEqual(log["stdout"], "")
                 self.assertEqual(len(log["runtime_sha256"]), 64)
+
+    def test_clean_exit_without_product_information_is_logged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "TriAevum.exe"
+            exe.write_bytes(b"host")
+            result = SimpleNamespace(returncode=0, stdout="", stderr="loader note")
+            with patch("product_contract.run_native", return_value=result):
+                with self.assertRaisesRegex(ValueError, "without product information.*loader note"):
+                    query_product(exe)
+            log = json.loads((exe.parent / "TriAevum-preflight-error.json").read_text())
+            self.assertEqual(log["exit_status"], "0x00000000")
+            self.assertEqual(log["stderr"], "loader note")
+            # Lines another program printed before the document are skipped.
+            result.stdout = "overlay hooked\n" + json.dumps(fixture_product(), indent=2) + "\n"
+            with patch("product_contract.run_native", return_value=result):
+                self.assertEqual(query_product(exe)["product"], fixture_product())
 
     def test_log_write_failure_does_not_hide_loader_error(self):
         with tempfile.TemporaryDirectory() as directory:

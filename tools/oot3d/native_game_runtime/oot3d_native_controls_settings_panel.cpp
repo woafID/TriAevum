@@ -142,6 +142,12 @@ constexpr std::array<NativeMotionSource, 8> kMotionSources{
     NativeMotionSource::Automatic,
 };
 
+constexpr std::array kCameraSources{
+    NativeMotionSource::Disabled, NativeMotionSource::DigitalLook,
+    NativeMotionSource::Mouse, NativeMotionSource::RightStick,
+    NativeMotionSource::Automatic,
+};
+
 constexpr std::array<const char*, kNativeControlActionCount> kActionLabels{
     "Move forward", "Move backward", "Move left", "Move right",
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Select", "Start",
@@ -230,6 +236,10 @@ class NativeControlsSettingsPanel final
         if (mTopScreen) DrawTopScreenActionBindings(mTopDraft);
         else ImGui::TextDisabled("TopScreen profile is not active");
       });
+      section("Gameplay", [&] {
+        if (mTopScreen) DrawTopScreenGameplay(mTopDraft);
+        else ImGui::TextDisabled("TopScreen profile is not active");
+      });
       ImGui::EndTabBar();
     }
     DrawBindingCapture();
@@ -314,8 +324,13 @@ class NativeControlsSettingsPanel final
         const auto previous = mControlDraft;
         mControlDraft = NativeControlPreset(mPresetSelection);
         mControlDraft.PreferredControllerGuid = previous.PreferredControllerGuid;
+        mControlDraft.PreferredControllerSerial = previous.PreferredControllerSerial;
         mControlDraft.GyroscopeBiasDegreesPerSecond = previous.GyroscopeBiasDegreesPerSecond;
         mControlDraft.AccelerometerNeutral = previous.AccelerometerNeutral;
+        mControlDraft.CalibrationControllerGuid = previous.CalibrationControllerGuid;
+        mControlDraft.CalibrationControllerSerial = previous.CalibrationControllerSerial;
+        mControlDraft.ControllerTouchpadEnabled = previous.ControllerTouchpadEnabled;
+        mControlDraft.ControllerTouchpadIndex = previous.ControllerTouchpadIndex;
         mControlDirty = true;
         ImGui::CloseCurrentPopup();
       }
@@ -359,12 +374,23 @@ class NativeControlsSettingsPanel final
 
   void DrawControllerSelection() {
     ImGui::SeparatorText("Controller");
+    if (ImGui::Checkbox("Controller touchpad", &mControlDraft.ControllerTouchpadEnabled)) {
+      MarkCustom(mControlDraft, mControlDirty);
+    }
+    if (mControlDraft.ControllerTouchpadEnabled &&
+        ImGui::SliderInt("Touchpad index", &mControlDraft.ControllerTouchpadIndex, 0, 15)) {
+      MarkCustom(mControlDraft, mControlDirty);
+    }
     const auto devices = mControls->DevicesSnapshot();
+    std::int32_t activeInstance = -1;
+    for (const auto& device : devices) if (device.Selected) activeInstance = device.InstanceId;
+    const auto draftInstance = ThreeDsRecomp::Input::SelectControllerDevice(
+        devices, mControlDraft.PreferredControllerGuid,
+        mControlDraft.PreferredControllerSerial, activeInstance);
     std::string preview = mControlDraft.PreferredControllerGuid.empty()
         ? "Automatic" : "Configured controller (disconnected)";
     for (const auto& device : devices) {
-      if (!mControlDraft.PreferredControllerGuid.empty() &&
-          device.Guid == mControlDraft.PreferredControllerGuid) {
+      if (!mControlDraft.PreferredControllerGuid.empty() && device.InstanceId == draftInstance) {
         preview = device.Name;
         break;
       }
@@ -374,15 +400,24 @@ class NativeControlsSettingsPanel final
           mControlDraft.PreferredControllerGuid.empty();
       if (ImGui::Selectable("Automatic", automatic)) {
         mControlDraft.PreferredControllerGuid.clear();
+        mControlDraft.PreferredControllerSerial.clear();
         MarkCustom(mControlDraft, mControlDirty);
       }
+      std::vector<std::string> listedModels;
       for (const auto& device : devices) {
-        const bool selected =
-            device.Guid == mControlDraft.PreferredControllerGuid;
-        std::string label = device.Name + "##" +
+        if (device.Serial.empty()) {
+          if (std::find(listedModels.begin(), listedModels.end(), device.Guid) != listedModels.end()) continue;
+          listedModels.push_back(device.Guid);
+        }
+        const bool selected = !mControlDraft.PreferredControllerGuid.empty() &&
+            (device.Serial.empty()
+                 ? mControlDraft.PreferredControllerGuid == device.Guid && mControlDraft.PreferredControllerSerial.empty()
+                 : device.InstanceId == draftInstance);
+        std::string label = device.Name + (device.Serial.empty() ? " (model)" : " [" + std::to_string(device.InstanceId) + "]") + "##" +
                             std::to_string(device.InstanceId);
         if (ImGui::Selectable(label.c_str(), selected)) {
           mControlDraft.PreferredControllerGuid = device.Guid;
+          mControlDraft.PreferredControllerSerial = device.Serial;
           MarkCustom(mControlDraft, mControlDirty);
         }
       }
@@ -393,9 +428,14 @@ class NativeControlsSettingsPanel final
     } else {
       for (const auto& device : devices) {
         ImGui::TextWrapped(
-            "%s%s%s", device.Name.c_str(),
+            "%s%s%s%s%s", device.Name.c_str(),
+            device.Selected && mControlDraft.ControllerEnabled ? " | active" : "",
             device.HasGyroscope ? " | gyro" : "",
-            device.HasAccelerometer ? " | accelerometer" : "");
+            device.HasAccelerometer ? " | accelerometer" : "",
+            device.TouchpadCount > 0 ? " | touchpad" : "");
+        if (device.InstanceId == draftInstance && device.Serial.empty()) {
+          ImGui::TextDisabled("No serial available: preference identifies the controller model.");
+        }
       }
     }
   }
@@ -582,7 +622,7 @@ class NativeControlsSettingsPanel final
     bool controlChanged =
         EnumCombo("Free-camera source",
                   &mControlDraft.FreeCameraSource,
-                  kMotionSources, NativeMotionSourceName);
+                  kCameraSources, NativeMotionSourceName);
     if (SourceUses(mControlDraft.FreeCameraSource,
                    NativeMotionSource::Mouse)) {
       controlChanged |= ControlWidgets::SliderFloat(
@@ -590,17 +630,6 @@ class NativeControlsSettingsPanel final
           &mControlDraft.MouseFreeCameraUnitsPerPixel,
           0.25F, 16.0F, "%.2f",
           ImGuiSliderFlags_Logarithmic);
-    }
-    if (SourceUses(mControlDraft.FreeCameraSource,
-                   NativeMotionSource::ControllerGyroscope) ||
-        SourceUses(mControlDraft.FreeCameraSource,
-                   NativeMotionSource::ControllerAccelerometer) ||
-        mControlDraft.FreeCameraSource ==
-            NativeMotionSource::ControllerMotion) {
-      controlChanged |= ControlWidgets::SliderFloat(
-          "Free-camera motion sensitivity",
-          &mControlDraft.FreeCameraMotionSensitivity,
-          0.1F, 4.0F, "%.2fx");
     }
     if (controlChanged) {
       MarkCustom(mControlDraft, mControlDirty);
@@ -612,10 +641,16 @@ class NativeControlsSettingsPanel final
 
   void DrawCalibration() {
     const auto calibration = mControls->CalibrationStatus();
+    const auto motion = mControls->MotionStatus();
+    ImGui::TextDisabled("Sensor samples: gyro %s | accelerometer %s",
+        motion.GyroscopeValid ? "received" : "unavailable",
+        motion.AccelerometerValid ? "received" : "unavailable");
     if (!calibration.Active) {
+      ImGui::BeginDisabled(!motion.GyroscopeValid && !motion.AccelerometerValid);
       if (ImGui::Button("Calibrate controller motion")) {
         mControls->BeginMotionCalibration();
       }
+      ImGui::EndDisabled();
     } else {
       ImGui::ProgressBar(
           static_cast<float>(calibration.SamplesCollected) /
@@ -625,7 +660,9 @@ class NativeControlsSettingsPanel final
       if (ImGui::Button("Cancel calibration")) {
         mControls->CancelMotionCalibration();
       }
+      if (calibration.WaitingForStillness) ImGui::TextDisabled("Waiting for a stationary controller");
     }
+    if (!calibration.Error.empty()) ImGui::TextWrapped("%s", calibration.Error.c_str());
     if (ImGui::Button("Reset motion calibration")) {
       std::string error;
       if (!mControls->ResetMotionCalibration(&error)) {

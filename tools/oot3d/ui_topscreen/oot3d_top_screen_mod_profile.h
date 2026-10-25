@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "oot3d_top_screen_config.h"
+#include "oot3d_top_screen_projection_state.h"
 #include "oot3d_ui/ui_hud_content.h"
 #include "oot3d_ui/ui_primitives.h"
 
@@ -83,7 +84,9 @@ struct TopScreenRuntimeGeometryApplyStats {
 // Pause-page constructors copy their scalar geometry tables into heap-backed
 // render streams once. A savestate captured before selecting TopScreen already
 // contains those streams, so rebuild their base positions and texcoords from
-// the verified tables without touching per-frame offsets or depth.
+// the verified tables without touching per-frame offsets or depth. Also
+// restore the Gear texture stages' verified nearest filters; WordsWritten
+// includes those sampler words.
 std::span<const TopScreenRuntimeQuadStreamContract>
 TopScreenVerifiedRuntimeQuadStreams() noexcept;
 
@@ -119,6 +122,9 @@ struct TopScreenExtendedInputFrame {
   bool XHeld = false;
   bool YHeld = false;
   bool RestorationLayout = false;
+  // The mapped consumer owns equipment changes; do not also synthesize
+  // held D-pad input as repeated native item-slot presses.
+  bool GameplayDpadActionsOwned = false;
   bool DpadLeftPressed = false;
   bool DpadRightPressed = false;
   bool DpadUpHeld = false;
@@ -222,6 +228,20 @@ bool ReadTopScreenHudCompositorGate(NativeA32Memory &memory,
                                     TopScreenHudCompositorGate *gate,
                                     std::string *error = nullptr);
 
+// Native Gameplay_InCsMode (0x0037577C) for a live play state and player.
+bool ReadTopScreenGameplayInCutsceneMode(NativeA32Memory &memory, std::uint32_t playState,
+                                         std::uint32_t player, bool *cutscene,
+                                         std::string *error = nullptr);
+
+// SingleScreen 3.0 replaces PauseQuestPage_Draw (0x0042B9F4) with 0x005C91D0,
+// which draws nothing while a pause owner (Items/Gear, Map, pause camera,
+// System) is active or while the runtime scene latch holds with native byte
+// 0x005C3F71 set: no page title and no Quest overlay over the paused scene.
+// `runtimeSceneLatch` is 0x005C8E0C's latch (TopScreenTouchCoordinateRoute).
+bool ReadTopScreenQuestPageDrawSuppressed(NativeA32Memory &memory,
+                                          bool runtimeSceneLatch, bool *suppressed,
+                                          std::string *error = nullptr);
+
 struct TopScreenNativeTouchQuad28LayoutStats {
   bool Eligible = false;
   bool Transformed = false;
@@ -256,10 +276,15 @@ struct TopScreenPauseEdgeGeometry {
 
 // Exact two-quad geometry and color math from payload producer 0x005CD1E0.
 // The caller supplies values owned by its recovered route/controller.
+// `itemsActive` (word 0x0050672C): 2.1.1 0x005D0494 gives the right quad no
+// width, because the widened Items page covers that side. Dungeon Map skips
+// both edges at 0x005D3A6C..0x005D3A74; keep a zero-width presentation so
+// page-redraw hints remain enabled and the fallback edges cannot reappear.
 TopScreenPauseEdgeGeometry BuildTopScreenPauseEdgeGeometry(
     bool hasScene, std::uint8_t sceneMode, std::uint32_t runtimeMode,
     std::uint8_t sceneFade, std::int32_t transitionStep, float nativeVisibility,
-    float globalColorScale) noexcept;
+    float globalColorScale, bool itemsActive = false,
+    bool dungeonMapActive = false) noexcept;
 
 // The ordinary gameplay producer at payload 0x005C9940 reuses the native
 // PauseTouchButton renderer. These are its exact six primary quads; the first
@@ -285,14 +310,30 @@ std::size_t AppendTopScreenMagicMeterPresentation(
     const oot3d::ui::UiTextureIdentity &pauseTopPage,
     std::vector<oot3d::ui::UiPrimitive> &output);
 
+// Draws from the SingleScreen 3.0 UI atlas (custom_ui01, 512x256).
 std::size_t AppendTopScreenTouchClusterPresentation(
     const TopScreenTouchClusterGeometry &geometry,
-    const oot3d::ui::UiTextureIdentity &pauseTopPage,
+    const oot3d::ui::UiTextureIdentity &uiAtlas,
     std::vector<oot3d::ui::UiPrimitive> &output);
 
 std::size_t AppendTopScreenPauseEdgePresentation(
     const TopScreenPauseEdgeGeometry &geometry,
     const oot3d::ui::UiTextureIdentity &itemPage,
+    std::vector<oot3d::ui::UiPrimitive> &output);
+
+// SingleScreen 3.0 L/R tab hints (0x005D4A0C), drawn after the redrawn page.
+// Items, Gear or Map must be open (not System); held L/R (0x005655A0 bits
+// 0x200/0x100) dims only its glyph to RGB 0.55.
+struct TopScreenTabHintInputs {
+  bool PageOpen = false;
+  bool LeftHeld = false;
+  bool RightHeld = false;
+};
+bool ReadTopScreenTabHintInputs(NativeA32Memory &memory, TopScreenTabHintInputs *inputs);
+// Two backing quads, then glyphs: custom_ui01 (512x256), rects 20/21 at
+// 0x0060A568. The 400x240 top-screen domain adds the page's 40-pixel offset.
+std::size_t AppendTopScreenTabHintPresentation(
+    const TopScreenTabHintInputs &inputs, const oot3d::ui::UiTextureIdentity &uiAtlas,
     std::vector<oot3d::ui::UiPrimitive> &output);
 
 struct TopScreenTexturedQuad {
@@ -346,6 +387,14 @@ struct TopScreenNativeItemOpacity {
   float Ocarina = 1.0F;
 };
 
+// SingleScreen 3.0 0x005CCF6C, the D-pad cross alpha: the first visible of
+// the ZR / ZL item lanes (0x0060D224 / 0x0060D228, stored by 0x005DC868 from
+// the native item colours), clamped to 1; with both hidden, 0.3 in gameplay
+// while the player has a nested owner (+0x12B8), otherwise 1.
+float ResolveTopScreenDpadGroupAlpha(const TopScreenNativeItemOpacity &lanes,
+                                     bool nestedOwner) noexcept;
+bool ReadTopScreenPlayerNestedOwner(NativeA32Memory &memory, bool *nestedOwner);
+
 bool AppendTopScreenNativeItemIconCopies(
     NativeA32Memory &memory, const std::array<float, 4> &nativeVerticalOffsets,
     float nativeAlpha, const oot3d::ui::UiTextureIdentity &itemIcons,
@@ -375,9 +424,10 @@ TopScreenTouchLabelsGeometry BuildTopScreenTouchLabelsGeometry(
     float nativeAlpha,
     TopScreenHudLayout layout = TopScreenHudLayout::Normal) noexcept;
 
+// Draws from the SingleScreen 3.0 UI atlas (custom_ui01, 512x256).
 std::size_t AppendTopScreenTouchLabelsPresentation(
     const TopScreenTouchLabelsGeometry &geometry,
-    const oot3d::ui::UiTextureIdentity &pauseTopPage,
+    const oot3d::ui::UiTextureIdentity &uiAtlas,
     std::vector<oot3d::ui::UiPrimitive> &output);
 
 struct TopScreenAuxiliaryTouchInputs {
@@ -386,30 +436,48 @@ struct TopScreenAuxiliaryTouchInputs {
   std::uint8_t StateSubtype = 0;
   std::int16_t PlayerHudMode = 0;
   std::uint32_t TouchLayoutState = 0;
+  bool ViewActorMode20 = false;
   std::uint32_t PauseState = 0;
   bool NestedSceneOwnerActive = false;
   bool AlternateHudRendererActive = false;
+  // Snapshot of 005E3D88, computed before the next 005E3D8C sample.
+  bool SuppressBCopies = false;
 };
 
 struct TopScreenAuxiliaryTouchGeometry {
   std::array<TopScreenTexturedQuad, 5> Quads{};
 };
 
-// Exact group-39 quads 34..38 produced by payload 0x005C9940. The visibility
-// flag formerly stored at payload BSS 0x005D4118 is derived directly from its
-// native PlayState, pause-state and alternate-renderer owners.
+// Auxiliary geometry consumes the native-update suppression snapshot.
+// Reading the current nested owner at draw time loses the one-update delay.
 bool ReadTopScreenAuxiliaryTouchInputs(NativeA32Memory &memory,
                                        TopScreenAuxiliaryTouchInputs *inputs,
                                        std::string *error = nullptr);
+// 005E2204 starts at 1 and advances once per native 41EAE0 update.
+bool AdvanceTopScreenViewAlpha(NativeA32Memory &memory, float *alpha);
 TopScreenAuxiliaryTouchGeometry BuildTopScreenAuxiliaryTouchGeometry(
     const TopScreenAuxiliaryTouchInputs &inputs,
     const std::array<float, 4> &nativeVerticalOffsets,
     float nativeAlpha,
     TopScreenHudLayout layout = TopScreenHudLayout::Normal) noexcept;
+// Draws from the SingleScreen 3.0 UI atlas (custom_ui01, 512x256).
 std::size_t AppendTopScreenAuxiliaryTouchPresentation(
     const TopScreenAuxiliaryTouchGeometry &geometry,
-    const oot3d::ui::UiTextureIdentity &pauseTopPage,
+    const oot3d::ui::UiTextureIdentity &uiAtlas,
     std::vector<oot3d::ui::UiPrimitive> &output);
+
+// Typed equivalents of payload words 005E3D8C (previous player state) and
+// 005E3D88 (this update's suppression). Never advance from presentation.
+struct TopScreenTouchCopyState {
+  bool PreviousNestedOwnerActive = false;
+  bool SuppressBCopies = false;
+};
+bool BeginTopScreenTouchCopyUpdate(NativeA32Memory &memory,
+                                  TopScreenTouchCopyState *state);
+// Call after input transactions. Retain exits bypass 005D5778..57A0.
+bool FinishTopScreenTouchCopyUpdate(NativeA32Memory &memory,
+                                   bool retainPrevious,
+                                   TopScreenTouchCopyState *state);
 
 struct TopScreenNativeTouchCopyStats {
   std::uint32_t SourceQuadsRead = 0;
@@ -426,7 +494,8 @@ bool AppendTopScreenNativeTouchCopies(
     NativeA32Memory &memory, const oot3d::ui::UiTextureIdentity &pauseTopPage,
     std::vector<oot3d::ui::UiPrimitive> &output,
     TopScreenNativeTouchCopyStats *stats = nullptr,
-    std::string *error = nullptr, const TopScreenUiConfig *config = nullptr);
+    std::string *error = nullptr, const TopScreenUiConfig *config = nullptr,
+    bool suppressBCopies = false);
 
 // Clips native gameplay HUD primitives to OoT3D's 400x240 top surface.
 // Renderer presentation maps that logical surface to the host output;
@@ -442,11 +511,27 @@ void ApplyTopScreenHudScale(
     std::span<oot3d::ui::UiPrimitive> primitives,
     const TopScreenUiConfig &config) noexcept;
 
+// SingleScreen 3.0 button group placement before the HUD scale: size
+// (modopts+0x2D) and offset (+0x2E/+0x2F), which the hub 0x005DB6B4..0x005DB75C
+// clamps to [-20, 10] x [-10, 40] px after the HUD scale.
+struct TopScreenButtonGroupPlacement {
+  float Scale = 1.0F;
+  float OffsetX = 0.0F;
+  float OffsetY = 0.0F;
+};
+TopScreenButtonGroupPlacement ResolveTopScreenButtonGroupPlacement(
+    const TopScreenUiConfig &config) noexcept;
+
 struct TopScreenVec3 {
   float X = 0.0F;
   float Y = 0.0F;
   float Z = 0.0F;
 };
+
+bool RelocateTopScreenTimerQuad(std::array<TopScreenVec3, 4> &quad,
+                               float hudScale) noexcept;
+bool ApplyTopScreenTimerCounterLayout(NativeA32Memory &memory, float hudScale,
+                                     std::string *error = nullptr);
 
 struct TopScreenQuestGeometryContext {
   std::uint32_t PauseState = 0;
@@ -457,27 +542,13 @@ struct TopScreenQuestGeometryContext {
   float HudScale = 1.0F;
   float HudMarginX = 0.0F;
   float HudMarginY = 0.0F;
-};
-
-struct TopScreenPauseProjectionState {
-  struct TrackedPosition {
-    std::uint32_t Address = 0;
-    std::uint32_t OriginalBits = 0;
-    std::uint32_t LastWrittenBits = 0;
-    bool Valid = false;
-  };
-
-  // The host configuration replaces payload storage 0x005D66AC. The false
-  // state moves both the native minimap and its indicator streams outside the
-  // visible canvas.
-  bool AlternatePage = true;
-  float OffsetX = 0.0F;
-  float OffsetY = 0.0F;
-  bool NativeQuestGate = false;
-  bool QuestDrawModelAdjusted = false;
-  TrackedPosition MapX;
-  TrackedPosition MapY;
-  std::array<TrackedPosition, 4U * 64U> IconX;
+  // SingleScreen 3.0 0x005C84B8 places the A group with the button group:
+  // its size (0x0060D20C) and its offset, here before the HUD scale.
+  float ButtonGroupScale = 1.0F;
+  float ButtonGroupOffsetX = 0.0F;
+  float ButtonGroupOffsetY = 0.0F;
+  // 0x005DA3D4: alternate HUD mode 1 or 4 (0x004FC648+0x48) hides the A label.
+  bool ActionLabelHidden = false;
 };
 
 struct TopScreenSystemMenuLayerStats {
@@ -546,6 +617,30 @@ bool ApplyTopScreenQuestDrawModelTransform(
     TopScreenQuestModelTransformStats *stats = nullptr,
     std::string *error = nullptr);
 
+// SingleScreen 3.0 draws its button circles (hub 0x005DCAD0, from the
+// Gameplay_Draw hook 0x002E27C0) before the native Quest page, so the native
+// B item icon (Quest main renderer, ItemIcons) and its ammo digits (first
+// child, NumberGlyphs) cover the B circle. The host HUD is composed after the
+// native UI: at the Quest draw (0x0042B9F4) the quads around the B button are
+// copied for the host, drawn above its circle, and moved off screen for the
+// native draw (the submit rebuilds them every frame).
+struct TopScreenQuestCopiedQuad {
+  std::array<TopScreenVec2, 4> Positions{};
+  std::array<float, 8> Uvs{};
+  oot3d::ui::UiColor Color;
+  bool NumberGlyphs = false;
+};
+bool CaptureTopScreenQuestBButtonCopies(NativeA32Memory &memory,
+                                        const TopScreenUiConfig &config,
+                                        std::vector<TopScreenQuestCopiedQuad> *copies,
+                                        std::string *error = nullptr);
+// Final native coordinates: append after the HUD scale.
+std::size_t AppendTopScreenQuestBButtonCopiesPresentation(
+    std::span<const TopScreenQuestCopiedQuad> copies,
+    const oot3d::ui::UiTextureIdentity &itemIcons,
+    const oot3d::ui::UiTextureIdentity &numberGlyphs,
+    std::vector<oot3d::ui::UiPrimitive> &output);
+
 bool ReadTopScreenQuestGeometryContext(
     NativeA32Memory &memory, TopScreenQuestGeometryContext *context,
     const TopScreenPauseProjectionState *projection = nullptr,
@@ -600,6 +695,16 @@ ResolveTopScreenPauseTargetCommand(const TopScreenPauseTargetCommand &command,
                                    bool routeActive) noexcept;
 TopScreenPauseTargetPlan ResolveTopScreenPausePageRedrawTargetCommand(
     const TopScreenPauseTargetCommand &command) noexcept;
+// Ordinary System draws inside DrawViewPass, before the top transfer. A
+// previous page redraw must not swap its scene into the lower framebuffer.
+TopScreenPauseTargetPlan ResolveTopScreenPauseCompositionTargetCommand(
+    const TopScreenPauseTargetCommand &command, bool routeActive,
+    bool pageRedrawActive, bool systemActive) noexcept;
+// 2.1.1 0x005D32A4: widened Items, dungeon Map and System use the full
+// 400-wide viewport; World Map and ordinary pages stay centred. The System
+// compositor sets its viewport explicitly while retaining native targets.
+void WidenTopScreenPauseTargetForPage(TopScreenPauseTargetPlan &plan,
+                                      bool widePage) noexcept;
 
 struct TopScreenPauseChildState {
   std::array<std::uint32_t, 6> Values{};
@@ -615,6 +720,8 @@ enum class TopScreenPauseChildSuppressionSet : std::uint8_t {
   // The stable page path in 0x005CE57C suppresses only the touch owner before
   // redrawing the complete active page in the top-screen viewport.
   PageRedraw,
+  // 2.1.1 0x005D3234..0x005D324C: touch 0, backdrop-skip 1; System stays live.
+  SystemPageRedraw,
 };
 
 struct TopScreenAlternateRendererState {
@@ -630,6 +737,7 @@ struct TopScreenPauseDrawInputs {
   bool HasScene = false;
   std::uint8_t SceneMode = 0;
   std::uint8_t SceneVariant = 0;
+  std::uint32_t SceneSubmode = 0;
   std::uint16_t SceneSequence = 0;
   std::uint32_t RuntimeMode = 0;
   std::uint32_t EntranceIndex = 0;
@@ -640,6 +748,10 @@ struct TopScreenPauseDrawInputs {
   bool AnyPageGateActive = false;
   std::array<std::uint32_t, 6> ChildStates{};
 };
+
+// TopScreen 2.1.1 FUN_005CF75C: native GameOver phases, not a scene ID.
+bool IsTopScreenGameOverPresentation(
+    const TopScreenPauseDrawInputs &inputs) noexcept;
 
 enum class TopScreenPauseClosePage : std::uint8_t {
   None,
@@ -682,6 +794,10 @@ struct TopScreenPauseDrawRoutingState {
   bool NativeTransitionLatched = false;
   bool SuppressionDelayArmed = false;
   std::uint16_t SuppressionDelayCommands = 0;
+  // SingleScreen 3.0 0x005CD348 returns 0 while the View Model is open, so
+  // the native pause scene (the Gear item model) keeps the upper screen. Host
+  // input, refreshed before each decision.
+  bool NativeSceneRequested = false;
 };
 
 struct TopScreenPausePageRedrawInputs {
@@ -713,7 +829,19 @@ struct TopScreenRendererVisibilityRouteState {
   std::int32_t FadeStep = 0;
   std::int32_t DelayCalls = 0;
   bool RendererConflict = false;
+  // SingleScreen 3.1 0x0060FA84+0x6AC in scene mode 7 (0x005D49FC): the
+  // Visions menu (submode 4) has a visible renderer, so its list goes on top.
+  bool VisionsRenderersRouted = false;
 };
+
+// SingleScreen 3.1 0x005D67DC, scene mode 7: the Sheikah Stone's Visions
+// menu (play+0x104 == 4) outside a native transition (0x0035B164).
+bool IsTopScreenVisionsMenu(const TopScreenPauseDrawInputs &inputs) noexcept;
+// 3.1 0x005D6DC8: the fade of the top-screen Visions backdrop and edges,
+// min(step / 24, 1); the step advances to 24 while the list is routed.
+float ResolveTopScreenVisionsFade(std::int32_t step) noexcept;
+bool RestoreTopScreenVisionsTerminalRenderer(NativeA32Memory &memory,
+                                             std::string *error = nullptr);
 
 struct TopScreenRendererVisibilityInputs {
   std::uint32_t ControllerAddress = 0;
@@ -783,6 +911,10 @@ bool ResolveTopScreenRendererVisibilityRoute(
     NativeA32Memory &memory, const TopScreenRendererVisibilityInputs &inputs,
     TopScreenRendererVisibilityRouteState *state,
     TopScreenRendererVisibilityAction *action, std::string *error = nullptr);
+bool PrepareTopScreenGameOverDraw(
+    NativeA32Memory &memory, std::uint32_t controller,
+    const TopScreenPauseDrawInputs &inputs, bool runtimeSceneLatch,
+    TopScreenRendererVisibilityRouteState *state, std::string *error = nullptr);
 bool ReadTopScreenPauseControllerInputs(NativeA32Memory &memory,
                                         TopScreenPauseControllerInputs *inputs,
                                         std::string *error = nullptr);
@@ -823,6 +955,55 @@ bool ResolveTopScreenPauseIconBuild(TopScreenPauseIconBuild *build,
 // Payload wrapper 0x005D005C skips the lower-screen touch-button callback for
 // the contiguous native pause states 12..19.
 bool SuppressTopScreenTouchButtonDraw(std::uint32_t pauseState) noexcept;
+
+// TopScreen 2.1.1 and SingleScreen 3.0/3.1 make PauseDungeonMap_HandleCursorInput
+// (0x00442F38) a `bx lr`, which also drops the native floor and dungeon-item
+// navigation (#89). The port keeps only the mod's ownership of B (the mod's
+// own path closes the page or opens Save) and runs the native navigation on
+// every other update. `pressedButtons` is the pause input word 0x0033B5EC
+// returns: 0x0050AF18, or 0x0050AF14 when that is zero.
+bool SkipTopScreenDungeonMapCursorInput(std::uint32_t pressedButtons) noexcept;
+bool ReadTopScreenPausePressedButtons(NativeA32Memory &memory,
+                                      std::uint32_t *pressedButtons);
+
+// TopScreen 2.1.1 shows the native item/gear description (message context
+// 0x005C1878, drawn under the relocated page) over the page when SELECT is
+// pressed on an open Items or Gear page. Typed form of payload word
+// 0x005E3D3C; see I:/_triaevum_work/topscreen-r6/R6_SPEC.md.
+struct TopScreenItemDescriptionInputs {
+  std::uint32_t Items = 0;      // 0x0050672C
+  std::uint32_t Gear = 0;       // 0x00504484
+  std::uint32_t System = 0;     // 0x0050A530
+  std::uint32_t Controller = 0; // 0x0050AF68
+  std::int32_t ItemsCursorRow = 0; // 0x00506774
+  std::int32_t GearCursor = 0;     // 0x0050448C
+};
+bool ReadTopScreenItemDescriptionInputs(NativeA32Memory &memory,
+                                        TopScreenItemDescriptionInputs *inputs);
+// 0x005D5730..5BBC: the description clears unless Items or Gear is browsing
+// (state 2) with no System page, then a SELECT edge toggles it. Returns true
+// when it toggled, which plays sound 0x01000498.
+bool UpdateTopScreenItemDescription(const TopScreenItemDescriptionInputs &inputs,
+                                    bool selectPressed, bool &visible) noexcept;
+// 0x005D5BC0: SELECT reaches the gameplay routes (minimap, Save) only while
+// the pause controller is in its gameplay state 2.
+bool TopScreenItemDescriptionOwnsSelect(
+    const TopScreenItemDescriptionInputs &inputs) noexcept;
+// 0x005D3344..33B0: redraw over the page while visible, no System page and
+// Items or Gear browsing; X is 300 (other half of the screen) when the Items
+// cursor row is >= 2, or the Gear cursor is in 0x13..0x19.
+bool TopScreenItemDescriptionDrawEligible(const TopScreenItemDescriptionInputs &inputs,
+                                          bool visible) noexcept;
+std::uint32_t ResolveTopScreenItemDescriptionOffset(
+    const TopScreenItemDescriptionInputs &inputs) noexcept;
+
+// The draw call 0x0042F5CC goes through payload predicate 0x005CB5E8, which
+// also rejects the four native page predicates 0x002FCAD4, 0x002FCAEC,
+// 0x002FCDD4 and 0x004392B0 (Gear, Items, Map and System page states). Its
+// remaining clause belongs to the mod's in-game settings overlay, which the
+// F1 panel replaces. The submit call keeps the narrower state interval.
+bool SuppressTopScreenTouchButtonPageDraw(
+    std::uint32_t pauseState, const TopScreenPauseDrawInputs &inputs) noexcept;
 
 struct TopScreenControlFlowContract {
   std::uint32_t Entry = 0;

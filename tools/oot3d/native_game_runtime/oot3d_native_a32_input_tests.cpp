@@ -126,9 +126,9 @@ int main(int argc, char** argv) {
     Require(mousePreset.NativeAimSource == NativeMotionSource::Mouse &&
             mousePreset.FreeCameraSource == NativeMotionSource::Mouse && mousePreset.CaptureMouseInGameplay,
             "keyboard/mouse preset must use mouse for aim and free camera");
-    Require(controllerPreset.NativeAimSource == NativeMotionSource::RightStick &&
+    Require(controllerPreset.NativeAimSource == NativeMotionSource::Automatic &&
             controllerPreset.FreeCameraSource == NativeMotionSource::RightStick,
-            "controller preset must use the right stick for aim and free camera");
+            "controller preset must discover aiming sensors without changing free camera");
     NativeControlHostInputState controllerMotion;
     controllerMotion.RightStickX = 28000;
     controllerMotion.ControllerMotion.GyroscopeValid = true;
@@ -136,8 +136,24 @@ int main(int argc, char** argv) {
     const auto controllerMapped = MapNativeControlInput(controllerPreset, controllerMotion);
     controllerMotion.ControllerMotion = {};
     const auto withoutSensor = MapNativeControlInput(controllerPreset, controllerMotion);
-    Require(controllerMapped.CStick.X > 0 && controllerMapped.Hid.GyroscopeDegreesPerSecond == withoutSensor.Hid.GyroscopeDegreesPerSecond,
-            "controller preset mixed motion sensors into right-stick aiming");
+    Require(controllerMapped.CStick.X > 0 && controllerMapped.CStick.X == withoutSensor.CStick.X &&
+            controllerMapped.Hid.GyroscopeDegreesPerSecond[0] < -89.0F &&
+            std::abs(controllerMapped.Hid.GyroscopeDegreesPerSecond[1]) > 1.0F,
+            "controller preset must combine stick and gyro in aim, but not in camera");
+    controllerMotion.RightStickX = 0;
+    controllerMotion.ControllerMotion.GyroscopeValid = true;
+    controllerMotion.ControllerMotion.AccelerometerValid = true;
+    controllerMotion.ControllerMotion.GyroscopeDegreesPerSecond = {-12, 23, 5};
+    controllerMotion.ControllerMotion.Accelerometer = {0.1F, -0.95F, 0.2F};
+    const auto automaticMotion = MapNativeControlInput(controllerPreset, controllerMotion);
+    Require(automaticMotion.Hid.GyroscopeDegreesPerSecond == controllerMotion.ControllerMotion.GyroscopeDegreesPerSecond &&
+            automaticMotion.Hid.Accelerometer == controllerMotion.ControllerMotion.Accelerometer &&
+            automaticMotion.CStick.X == 0 && automaticMotion.CStick.Y == 0,
+            "factory controller preset requires manual setup/calibration for motion aiming");
+    auto explicitStick = controllerPreset;
+    explicitStick.NativeAimSource = NativeMotionSource::RightStick;
+    Require(MapNativeControlInput(explicitStick, controllerMotion).Hid.GyroscopeDegreesPerSecond == std::array<float, 3>{},
+            "automatic motion overrides explicit stick-only choice");
     const auto defaults = NativeControlDefaults();
     Require(defaults.ControllerEnabled && defaults.KeyboardEnabled && defaults.MouseEnabled &&
                 defaults.MovementStick == NativeAnalogStick::Left &&
@@ -259,11 +275,12 @@ int main(int argc, char** argv) {
                 mappedController.Hid.AccelerometerValid &&
                 std::abs(
                     mappedController.Hid.GyroscopeDegreesPerSecond[0] -
-                    -180.0F) < 0.001F &&
+                    -170.0F) < 0.001F &&
                 std::abs(
                     mappedController.Hid.GyroscopeDegreesPerSecond[2] -
-                    0.0F) < 0.001F,
-            "automatic controller profile did not prioritize active C-stick");
+                    (20.0F * std::sin(3.14159265358979323846 / 120.0) +
+                     30.0F * std::cos(3.14159265358979323846 / 120.0))) < 0.001F,
+            "automatic controller profile did not compose calibrated motion with C-stick");
     auto motionOnlyControllerHost = controllerHost;
     motionOnlyControllerHost.RightStickY = 0;
     auto automaticControllerConfig = controllerConfig;
@@ -373,14 +390,24 @@ int main(int argc, char** argv) {
 
     std::string serializedControls;
     std::string controlsError;
+    controllerConfig.PreferredControllerGuid = "test-pad";
+    controllerConfig.PreferredControllerSerial = "aa01";
     Require(SerializeNativeControlConfigText(
                 controllerConfig, &serializedControls, &controlsError),
             controlsError);
     NativeControlConfig parsedControls;
     Require(ParseNativeControlConfigText(
+                R"({"schema":"oot3d_native_controls_v1","profile":"controller","controller_guid":"legacy"})",
+                &parsedControls, &controlsError) &&
+                parsedControls.PreferredControllerGuid == "legacy" &&
+                parsedControls.PreferredControllerSerial.empty(),
+            "legacy GUID-only configuration did not load");
+    Require(ParseNativeControlConfigText(
                 serializedControls, &parsedControls, &controlsError) &&
                 parsedControls.Profile ==
                     NativeControlProfile::Controller &&
+                parsedControls.PreferredControllerGuid == "test-pad" &&
+                parsedControls.PreferredControllerSerial == "aa01" &&
                 parsedControls.GyroscopeBiasDegreesPerSecond ==
                     controllerConfig.GyroscopeBiasDegreesPerSecond,
             "native control JSON did not round-trip");
@@ -390,6 +417,20 @@ int main(int argc, char** argv) {
                     parsedControls == config,
                 "control persistence changed combined defaults or an explicit keyboard-only preference");
     }
+
+    Require(ParseNativeControlConfigText(
+                R"({"schema":"oot3d_native_controls_v1","profile":"controller","free_camera":{"source":"controller_motion","motion_sensitivity":4}})",
+                &parsedControls, &controlsError) &&
+                parsedControls.FreeCameraSource == NativeMotionSource::RightStick,
+            "legacy motion camera profile was not migrated");
+    parsedControls.FreeCameraSource = NativeMotionSource::ControllerAccelerometer;
+    NativeControlConfigRuntime migratedCamera({}, parsedControls);
+    Require(migratedCamera.Snapshot().Config.FreeCameraSource == NativeMotionSource::RightStick &&
+                migratedCamera.Preview(parsedControls, &controlsError) &&
+                migratedCamera.Snapshot().Config.FreeCameraSource == NativeMotionSource::RightStick &&
+                SerializeNativeControlConfigText(parsedControls, &serializedControls, &controlsError) &&
+                serializedControls.find("motion_sensitivity") == std::string::npos,
+            "programmatic camera profile or serialization retained motion routing");
 
     RequireTouch(MapHostPointerToNativeA32Touch(160, 0, 1280, 720, true),
                  true, true, 0, 0,
@@ -468,6 +509,10 @@ int main(int argc, char** argv) {
                      NativeA32TopScreenPage::None),
                  false, false, 0, 0,
                  "inactive page shortcut synthesized a touch");
+    Require(IsTopScreenStartRoutingMode(0U) &&
+                !IsTopScreenStartRoutingMode(1U) &&
+                !IsTopScreenStartRoutingMode(2U),
+            "TopScreen START routing must leave the title demo's START alone");
     Require(IsTopScreenGameplayInputMode(0U) &&
                 IsTopScreenGameplayInputMode(1U) &&
                 !IsTopScreenGameplayInputMode(2U) &&
@@ -510,6 +555,7 @@ int main(int argc, char** argv) {
                 !startRouting.OpenGestureHeld &&
                 !startRouting.CloseGestureHeld,
             "default profile did not preserve native START");
+    startRouting = {};
 
     Require(ResolveNativeA32TouchInputEnabled(false, true, false, false),
             "default profile ignored native touch ownership");
@@ -518,6 +564,28 @@ int main(int argc, char** argv) {
     Require(ResolveNativeA32TouchInputEnabled(true, true, true, false) &&
                 ResolveNativeA32TouchInputEnabled(true, true, false, true),
             "TopScreen did not retain frontend or pause-page touch ownership");
+
+    // TopScreen 2.1.1 reopens the last page that owned the pause UI
+    // (005E21C8): Items first, then Gear, then Map; other states keep it.
+    {
+        TopScreenStartRoutingState pageMemory;
+        const auto opened = [&](bool items, bool gear, bool map) {
+            ObserveTopScreenStartRoutingPage(items, gear, map, pageMemory);
+            NativeA32InputFrame start;
+            start.Hid.Buttons = NativeA32HidButtonMask(NativeA32HidButton::Start);
+            ReleaseTopScreenStartRoutingLatch(false, pageMemory);
+            ApplyTopScreenStartRouting(start, true, true, false, true, pageMemory);
+            Require(pageMemory.OpenRequested && !start.Hid.TouchPressed,
+                    "START did not capture a request without synthetic touch");
+            return pageMemory.LastPage;
+        };
+        Require(opened(false, false, false) == NativeA32TopScreenPage::Items &&
+                    opened(false, true, false) == NativeA32TopScreenPage::Gear &&
+                    opened(false, false, false) == NativeA32TopScreenPage::Gear &&
+                    opened(false, false, true) == NativeA32TopScreenPage::Map &&
+                    opened(true, true, true) == NativeA32TopScreenPage::Items,
+                "TopScreen START did not reopen the last native pause page");
+    }
 
     NativeA32InputFrame gameplayStart;
     gameplayStart.Hid.Buttons =
@@ -537,12 +605,11 @@ int main(int argc, char** argv) {
                                startRouting);
     Require(gameplayStart.Hid.Buttons ==
                 NativeA32HidButtonMask(NativeA32HidButton::A) &&
-                gameplayStart.Hid.TouchPressed &&
-                gameplayStart.Hid.TouchX == 224U &&
-                gameplayStart.Hid.TouchY == 221U &&
+                !gameplayStart.Hid.TouchPressed &&
+                startRouting.OpenRequested &&
                 startRouting.OpenGestureHeld &&
                 !startRouting.CloseGestureHeld,
-            "TopScreen gameplay START did not route to native Items");
+            "TopScreen gameplay START did not request the last page");
 
     NativeA32InputFrame continuedOpeningStart;
     continuedOpeningStart.Hid.Buttons =
@@ -550,12 +617,11 @@ int main(int argc, char** argv) {
     ApplyTopScreenStartRouting(continuedOpeningStart, true, true, false, true,
                                startRouting);
     Require(continuedOpeningStart.Hid.Buttons == 0U &&
-                continuedOpeningStart.Hid.TouchPressed &&
-                continuedOpeningStart.Hid.TouchX == 224U &&
-                continuedOpeningStart.Hid.TouchY == 221U &&
+                !continuedOpeningStart.Hid.TouchPressed &&
+                !startRouting.OpenRequested &&
                 startRouting.OpenGestureHeld &&
                 !startRouting.CloseGestureHeld,
-            "held opening START did not sustain the native Items touch");
+            "held opening START repeated its request or synthesized touch");
 
     NativeA32InputFrame heldOpeningStart;
     heldOpeningStart.Hid.Buttons =
@@ -629,12 +695,102 @@ int main(int argc, char** argv) {
         NativeA32HidButtonMask(NativeA32HidButton::Start);
     ApplyTopScreenStartRouting(repressedStart, true, true, false, true,
                                startRouting);
-    Require(repressedStart.Hid.TouchPressed &&
+    Require(!repressedStart.Hid.TouchPressed && startRouting.OpenRequested &&
                 startRouting.OpenGestureHeld &&
                 !startRouting.CloseGestureHeld,
             "START re-press after a poll-rate release was swallowed");
 
     ReleaseTopScreenStartRoutingLatch(false, startRouting);
+
+    // A held START that began outside gameplay does not become a fresh edge.
+    {
+        TopScreenStartRoutingState route;
+        NativeA32InputFrame sample;
+        sample.Hid.Buttons = NativeA32HidButtonMask(NativeA32HidButton::Start);
+        ApplyTopScreenStartRouting(sample, true, false, false, true, route);
+        Require(!route.OpenRequested, "ineligible START requested a page");
+        ApplyTopScreenStartRouting(sample, true, true, false, true, route);
+        Require(!route.OpenRequested, "held START became an edge on entering gameplay");
+        ReleaseTopScreenStartRoutingLatch(false, route);
+        sample.Hid.TouchPressed = true;
+        sample.Hid.TouchX = 31U;
+        sample.Hid.TouchY = 47U;
+        ApplyTopScreenStartRouting(sample, true, true, false, true, route);
+        Require(route.OpenRequested && sample.Hid.TouchPressed &&
+                    sample.Hid.TouchX == 31U && sample.Hid.TouchY == 47U,
+                "START changed an independent native touch sample");
+        sample.Hid.Buttons = 0U;
+        ApplyTopScreenStartRouting(sample, true, true, false, true, route);
+        Require(!route.OpenRequested && !route.OpenGestureHeld,
+                "short START request or gesture survived its consuming sample");
+    }
+
+    // One-screen title: the withheld version choice receives nothing until a
+    // START, A or touch press reveals it; that press never reaches the guest.
+    {
+        const uint32_t start = NativeA32HidButtonMask(NativeA32HidButton::Start);
+        const uint32_t a = NativeA32HidButtonMask(NativeA32HidButton::A);
+        const uint32_t right = NativeA32HidButtonMask(NativeA32HidButton::DpadRight);
+        TopScreenVersionChoiceRevealState reveal;
+        NativeA32InputFrame idle;
+        idle.Hid.Buttons = right;
+        idle.Hid.CirclePadX = 120;
+        Require(!ApplyTopScreenVersionChoiceReveal(idle, true, false, reveal) &&
+                    idle.Hid.Buttons == 0U && idle.Hid.CirclePadX == 0 &&
+                    !reveal.GestureHeld,
+                "withheld version choice received navigation");
+        NativeA32InputFrame press;
+        press.Hid.Buttons = start;
+        Require(ApplyTopScreenVersionChoiceReveal(press, true, false, reveal) &&
+                    press.Hid.Buttons == 0U && reveal.GestureHeld,
+                "START did not reveal the version choice");
+        NativeA32InputFrame held;
+        held.Hid.Buttons = start | right;
+        Require(!ApplyTopScreenVersionChoiceReveal(held, false, false, reveal) &&
+                    held.Hid.Buttons == 0U,
+                "the revealing START reached the revealed choice");
+        NativeA32InputFrame released;
+        released.Hid.Buttons = right;
+        Require(!ApplyTopScreenVersionChoiceReveal(released, false, false, reveal) &&
+                    released.Hid.Buttons == right && !reveal.GestureHeld,
+                "input after the revealing release was withheld");
+        NativeA32InputFrame confirm;
+        confirm.Hid.Buttons = a;
+        Require(!ApplyTopScreenVersionChoiceReveal(confirm, false, false, reveal) &&
+                    confirm.Hid.Buttons == a,
+                "A did not reach the revealed choice");
+        TopScreenVersionChoiceRevealState touchReveal;
+        NativeA32InputFrame touch;
+        touch.Hid.TouchPressed = true;
+        touch.Hid.TouchX = 100U;
+        Require(ApplyTopScreenVersionChoiceReveal(touch, true, false, touchReveal) &&
+                    !touch.Hid.TouchPressed,
+                "a touch did not reveal the version choice");
+        TopScreenVersionChoiceRevealState aReveal;
+        NativeA32InputFrame aPress;
+        aPress.Hid.Buttons = a;
+        Require(ApplyTopScreenVersionChoiceReveal(aPress, true, false, aReveal) &&
+                    aPress.Hid.Buttons == 0U,
+                "A did not reveal the version choice");
+        // START on the title prompt reaches the game (which brings the panels
+        // in) and is the reveal; holding it must not confirm a panel.
+        TopScreenVersionChoiceRevealState promptReveal;
+        NativeA32InputFrame promptStart;
+        promptStart.Hid.Buttons = start;
+        Require(ApplyTopScreenVersionChoiceReveal(promptStart, false, true, promptReveal) &&
+                    promptStart.Hid.Buttons == start && promptReveal.GestureHeld,
+                "START on the title prompt was not passed and counted as the reveal");
+        NativeA32InputFrame promptHeld;
+        promptHeld.Hid.Buttons = start;
+        Require(!ApplyTopScreenVersionChoiceReveal(promptHeld, false, false, promptReveal) &&
+                    promptHeld.Hid.Buttons == 0U,
+                "the held prompt START reached the panels");
+        NativeA32InputFrame promptIdle;
+        promptIdle.Hid.Buttons = right;
+        Require(!ApplyTopScreenVersionChoiceReveal(promptIdle, false, true, aReveal) &&
+                    promptIdle.Hid.Buttons == right,
+                "the title prompt withheld unrelated input");
+    }
 
     const auto path = std::filesystem::temp_directory_path() /
                       "oot3d_native_a32_input_timeline.json";
@@ -651,6 +807,8 @@ int main(int argc, char** argv) {
                     runtime.Snapshot().Config == preview &&
                     !std::filesystem::exists(controlsPath),
                 "control live preview was not isolated from persistence");
+        NativeControlDeviceDescriptor calibratedDevice{1, "gyro-pad", "Motion pad", true, true, "unit1", true};
+        runtime.ObserveDevices({calibratedDevice});
         runtime.BeginMotionCalibration();
         NativeControlMotionObservation observation;
         observation.GyroscopeDegreesPerSecond = {1.0F, -2.0F, 3.0F};
@@ -670,6 +828,34 @@ int main(int argc, char** argv) {
                         observation.Accelerometer &&
                     std::filesystem::is_regular_file(controlsPath),
                 "motion calibration did not average and persist samples");
+        Require(calibrated.CalibrationControllerGuid == "gyro-pad" &&
+                calibrated.CalibrationControllerSerial == "unit1" &&
+                ControlsForDevice(calibrated, &calibratedDevice).GyroscopeBiasDegreesPerSecond ==
+                    observation.GyroscopeDegreesPerSecond,
+                "calibration was not associated with selected device");
+        calibratedDevice.Serial = "unit2";
+        Require(ControlsForDevice(calibrated, &calibratedDevice).GyroscopeBiasDegreesPerSecond ==
+                    std::array<float, 3>{}, "calibration leaked to another physical controller");
+        NativeControlConfig reloaded;
+        Require(LoadNativeControlConfig(controlsPath, &reloaded, &controlsError) && reloaded == calibrated,
+                "device-scoped calibration round trip");
+        runtime.BeginMotionCalibration();
+        runtime.ObserveDevices({});
+        Require(!runtime.CalibrationStatus().Active && !runtime.CalibrationStatus().Error.empty(),
+                "disconnect did not cancel calibration");
+        runtime.ObserveDevices({calibratedDevice});
+        observation.GyroscopeValid = false;
+        runtime.BeginMotionCalibration();
+        for (uint32_t sample = 0; sample < 60U; ++sample) runtime.ObserveMotion(observation);
+        Require(runtime.Snapshot().Config.GyroscopeBiasDegreesPerSecond == std::array<float, 3>{},
+                "partial calibration reused the previous controller's unavailable sensor bias");
+        runtime.BeginMotionCalibration();
+        Require(runtime.ResetMotionCalibration(&controlsError) && !runtime.CalibrationStatus().Active &&
+                runtime.Snapshot().Config.CalibrationControllerGuid.empty(),
+                "reset left pending calibration able to overwrite neutral values");
+        auto invalidTouch = calibrated;
+        invalidTouch.ControllerTouchpadIndex = -1;
+        Require(!ValidateNativeControlConfig(invalidTouch, &controlsError), "invalid touchpad index accepted");
     }
     WriteText(path, R"json({
   "schema": "oot3d.native_game.input_timeline.v1",

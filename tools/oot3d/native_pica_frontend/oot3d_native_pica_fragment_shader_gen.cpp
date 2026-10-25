@@ -1,6 +1,8 @@
 #include "oot3d_native_pica_fragment_shader_gen.h"
+#include "oot3d_native_pica_tev_expressions.h"
 #include "oot3d_native_pica_proctex.h"
 #include "fast/oot3d/pica_fragment_lighting.h"
+#include "fast/renderer3ds/pica_texture_program.h"
 
 #include <cmath>
 #include <limits>
@@ -269,115 +271,10 @@ std::string SourceExpression(uint8_t source, size_t stage,
     }
 }
 
-std::string ColorModifier(const std::string& source, uint8_t modifier,
-                          bool& supported) {
-    switch (modifier) {
-    case 0x0:
-        return source + ".rgb";
-    case 0x1:
-        return "vec3(1.0) - " + source + ".rgb";
-    case 0x2:
-        return source + ".aaa";
-    case 0x3:
-        return "vec3(1.0) - " + source + ".aaa";
-    case 0x4:
-        return source + ".rrr";
-    case 0x5:
-        return "vec3(1.0) - " + source + ".rrr";
-    case 0x8:
-        return source + ".ggg";
-    case 0x9:
-        return "vec3(1.0) - " + source + ".ggg";
-    case 0xC:
-        return source + ".bbb";
-    case 0xD:
-        return "vec3(1.0) - " + source + ".bbb";
-    default:
-        supported = false;
-        return "vec3(0.0)";
-    }
-}
-
-std::string AlphaModifier(const std::string& source, uint8_t modifier,
-                          bool& supported) {
-    switch (modifier) {
-    case 0:
-        return source + ".a";
-    case 1:
-        return "1.0 - " + source + ".a";
-    case 2:
-        return source + ".r";
-    case 3:
-        return "1.0 - " + source + ".r";
-    case 4:
-        return source + ".g";
-    case 5:
-        return "1.0 - " + source + ".g";
-    case 6:
-        return source + ".b";
-    case 7:
-        return "1.0 - " + source + ".b";
-    default:
-        supported = false;
-        return "0.0";
-    }
-}
-
-std::string ColorOperation(uint8_t operation, const std::string& a,
-                           const std::string& b, const std::string& c,
-                           bool& supported) {
-    switch (operation) {
-    case 0:
-        return a;
-    case 1:
-        return a + " * " + b;
-    case 2:
-        return a + " + " + b;
-    case 3:
-        return a + " + " + b + " - vec3(0.5)";
-    case 4:
-        return "mix(" + b + ", " + a + ", " + c + ")";
-    case 5:
-        return a + " - " + b;
-    case 6:
-    case 7:
-        return "vec3(dot(" + a + " - vec3(0.5), " + b +
-               " - vec3(0.5)) * 4.0)";
-    case 8:
-        return "fma(" + a + ", " + b + ", " + c + ")";
-    case 9:
-        return "min(" + a + " + " + b + ", vec3(1.0)) * " + c;
-    default:
-        supported = false;
-        return "vec3(0.0)";
-    }
-}
-
-std::string AlphaOperation(uint8_t operation, const std::string& a,
-                           const std::string& b, const std::string& c,
-                           bool& supported) {
-    switch (operation) {
-    case 0:
-        return a;
-    case 1:
-        return a + " * " + b;
-    case 2:
-        return a + " + " + b;
-    case 3:
-        return a + " + " + b + " - 0.5";
-    case 4:
-        return "mix(" + b + ", " + a + ", " + c + ")";
-    case 5:
-        return a + " - " + b;
-    case 8:
-        return "fma(" + a + ", " + b + ", " + c + ")";
-    case 9:
-        return "min(" + a + " + " + b + ", 1.0) * " + c;
-    default:
-        supported = false;
-        return "0.0";
-    }
-}
+using TevExpressions::ColorModifier;
+using TevExpressions::AlphaModifier;
+using TevExpressions::ColorOperation;
+using TevExpressions::AlphaOperation;
 
 std::string AlphaDiscardCondition(uint8_t function) {
     switch (function) {
@@ -460,11 +357,26 @@ size_t StreamOffset(std::ostringstream& stream) {
 
 } // namespace
 
+bool Oot3dPicaFragmentDepthIsRasterDepth(const Oot3dPicaDecodedDrawState& state, Oot3dPicaTevMode mode) {
+    // Z-buffering with scale -1 and offset 0 makes the PICA depth
+    // (-z/w * -1 + 0) bit-identical to the rasterized depth, so a specialized
+    // program leaves depth to fixed function and keeps early depth testing.
+    // The parametric (always-available) programs keep their single explicit
+    // form: it writes the same depth, and their built-in artifacts stay valid.
+    return mode == Oot3dPicaTevMode::Specialized && state.OutputMerger.FragmentOperationMode != 3U &&
+           state.Viewport.ZBuffering && state.Viewport.DepthRange == -1.0F && state.Viewport.NearPlane == 0.0F;
+}
+
 uint64_t ComputeOot3dPicaFragmentShaderStateKey(
     const Oot3dPicaDrawPacket& packet,
-    const Oot3dPicaDecodedDrawState& state) {
+    const Oot3dPicaDecodedDrawState& state, Oot3dPicaTevMode mode) {
     constexpr uint64_t kFnvOffset = 1469598103934665603ULL;
-    uint64_t key = HashWord(kFnvOffset, packet.Registers[0x080U]);
+    // Version the compiler semantics, not just the input register values.
+    uint64_t key = HashWord(kFnvOffset, 0x54455605U);
+    key = HashWord(key, packet.Registers[0x080U]);
+    key = HashWord(key, static_cast<uint32_t>(mode));
+    if (Oot3dPicaFragmentDepthIsRasterDepth(state, mode))
+        key = HashWord(key, 0x5A524153U);
     key = HashWord(key, packet.Registers[0x08FU]);
     const auto lighting =
         Fast::Oot3d::DecodePicaFragmentLighting(packet.Registers);
@@ -551,6 +463,12 @@ Oot3dPicaFragmentUniformState BuildOot3dPicaFragmentUniformState(
             static_cast<float>(difference) / 2047.0F};
     }
     uniforms.Lighting = BuildOot3dPicaFragmentLightingUniformState(packet);
+    uniforms.LightingProgram = Fast::Oot3d::BuildPicaLightingProgram(
+        Fast::Oot3d::DecodePicaFragmentLighting(packet.Registers));
+    uniforms.FragmentControl = {packet.Registers[0x0E0U], packet.Registers[0x104U],
+                               packet.Registers[0x080U], packet.Registers[0x083U]};
+    uniforms.ProcTexProgram = BuildOot3dPicaProcTexProgram(packet);
+    Fast::Renderer3ds::DecodePicaTevProgram(packet.Registers, uniforms.TevProgram);
     return uniforms;
 }
 
@@ -558,8 +476,19 @@ bool GenerateOot3dPicaFragmentShader(
     const Oot3dPicaDrawPacket& packet,
     const Oot3dPicaDecodedDrawState& state,
     Oot3dPicaGeneratedFragmentShader& shader, std::string* error,
-    Oot3dPicaShaderBuildPurpose purpose) {
+    Oot3dPicaShaderBuildPurpose purpose, Oot3dPicaTevMode mode) {
     shader = {};
+    const bool parametric = mode == Oot3dPicaTevMode::Parametric;
+    // Disabled texture slots receive the backend's normalized-color fallback.
+    // Only an enabled Shadow2D slot can require an integer image interface.
+    const bool integerTexture0 = state.Textures[0].Type == 2U &&
+                                 (!parametric || state.Textures[0].Enabled);
+    Fast::Renderer3ds::PicaTevProgram program;
+    if (parametric && Fast::Renderer3ds::DecodePicaTevProgram(packet.Registers, program) !=
+            Fast::Renderer3ds::PicaTevDecodeError::None) {
+        SetError(error, DescribeUnsupportedTev(packet, state));
+        return false;
+    }
     const auto lighting =
         Fast::Oot3d::DecodePicaFragmentLighting(packet.Registers);
     const bool procTexEnabled =
@@ -570,21 +499,26 @@ bool GenerateOot3dPicaFragmentShader(
     const bool procTexReferenced =
         Oot3dPicaReferencesProceduralTexture(packet) ||
         shadowProcTexReferenced;
-    // Procedural LUT values are embedded in source, unlike the dynamically
-    // bound lighting LUT image. A register-only cache cannot supply them.
-    if (purpose == Oot3dPicaShaderBuildPurpose::OfflineSource &&
+    // Only the legacy emitter embeds procedural LUT values in source. The
+    // parametric program receives them with the draw and can be built without them.
+    if (!parametric && purpose == Oot3dPicaShaderBuildPurpose::OfflineSource &&
         procTexReferenced && procTexEnabled) {
         SetError(error, "offline register-only shader input lacks procedural LUT payload");
         return false;
     }
     std::string procTexSource;
-    if (procTexReferenced && procTexEnabled &&
+    if (parametric && procTexReferenced && procTexEnabled &&
+        !Oot3dPicaProceduralTextureConfigurationSupported(packet)) {
+        SetError(error, "invalid native procedural texture configuration");
+        return false;
+    }
+    if (!parametric && procTexReferenced && procTexEnabled &&
         !GenerateOot3dPicaProceduralTextureSampler(
             packet, procTexSource, error)) {
         return false;
     }
     bool bumpTextureSupported = true;
-    const std::string bumpTextureSample =
+    std::string bumpTextureSample =
         lighting.Enabled &&
                 lighting.BumpMode != Fast::Oot3d::PicaLightingBumpMode::None
             ? TextureSampleExpression(lighting.BumpTextureUnit, state,
@@ -610,10 +544,18 @@ bool GenerateOot3dPicaFragmentShader(
     }
     std::string lightingDeclarations;
     std::string lightingMainBody;
+    if (parametric) {
+        bumpTextureSample = "(((fragment_uniforms.lighting_program.control.w >> 4u) & 3u) != 0u ? "
+            "pica_native_texture((fragment_uniforms.lighting_program.control.w >> 9u) & 3u, "
+            "pica_texcoord0, pica_texcoord1, pica_texcoord2) : vec4(0.0))";
+        shadowTextureSample = "((fragment_uniforms.lighting_program.control.w & 128u) != 0u ? "
+            "pica_native_texture((fragment_uniforms.lighting_program.control.w >> 11u) & 3u, "
+            "pica_texcoord0, pica_texcoord1, pica_texcoord2) : vec4(1.0))";
+    }
     if (!GenerateOot3dPicaFragmentLightingSource(
             packet, bumpTextureSample, shadowTextureSample,
             lightingDeclarations,
-            lightingMainBody, error, purpose)) {
+            lightingMainBody, error, purpose, parametric)) {
         return false;
     }
     const bool fragmentLighting = Oot3dPicaFragmentLightingEnabled(packet);
@@ -632,7 +574,7 @@ bool GenerateOot3dPicaFragmentShader(
         Oot3d::Renderer::kPicaFragmentOutputContractSchemaVersion,
         1U,
         0U,
-        state.OutputMerger.FragmentOperationMode == 3U
+        state.OutputMerger.FragmentOperationMode == 3U || Oot3dPicaFragmentDepthIsRasterDepth(state, mode)
             ? Oot3d::Renderer::PicaFragmentDepthOutput::FixedFunction
             : Oot3d::Renderer::PicaFragmentDepthOutput::ExplicitNative,
         false,
@@ -672,7 +614,10 @@ bool GenerateOot3dPicaFragmentShader(
               "layout(location=4) in float pica_texcoord0_w;\n"
               "layout(location=5) in vec4 pica_normquat;\n"
               "layout(location=6) in vec3 pica_view;\n";
-    source << (state.Textures[0].Type == 2U
+    if (parametric) source << Fast::Renderer3ds::PicaTevProgramGlsl();
+    if (parametric) source << Fast::Renderer3ds::PicaLightingProgramDeclaration;
+    if (parametric) source << Fast::Renderer3ds::PicaProcTexDeclaration;
+    source << (integerTexture0
                    ? "layout(set=0,binding=1) uniform usampler2D pica_texture0;\n"
                    : "layout(set=0,binding=1) uniform sampler2D pica_texture0;\n")
            << "layout(set=0,binding=2) uniform sampler2D pica_texture1;\n"
@@ -698,21 +643,30 @@ bool GenerateOot3dPicaFragmentShader(
                   "    int shadow_texture_bias;\n"
                   "    int shadow_orthographic;\n"
                   "    float shadow_bias_constant;\n"
-                  "    float shadow_bias_linear;\n"
-                  "} fragment_uniforms;\n";
+                  "    float shadow_bias_linear;\n";
+    if (parametric) source << "    PicaTevProgram tev_program;\n";
+    if (parametric) source << "    PicaLightingProgram lighting_program;\n";
+    if (parametric) source << "    uvec4 fragment_control;\n";
+    if (parametric) source << "    PicaProcTexProgram proctex_program;\n";
+    source << "} fragment_uniforms;\n";
     if (state.OutputMerger.FragmentOperationMode == 3U) {
         source << "layout(set=0,binding=5,r32ui) uniform uimage2D pica_shadow_buffer;\n";
     }
+    // log2(0) is undefined: a zero footprint (coordinates constant across the
+    // quad) selects the minimum LOD explicitly, the limit the footprint
+    // approaches, instead of relying on a driver's -inf.
     source << "layout(location=0) out vec4 pica_color;\n"
-              "vec3 byteround3(vec3 value) { return floor(value * 255.0 + 0.5) / 255.0; }\n"
-              "float byteround1(float value) { return floor(value * 255.0 + 0.5) / 255.0; }\n"
+           << TevExpressions::ByteRoundHelpers <<
               "float pica_texture_lod(vec2 coord, vec2 size) {\n"
               "    vec2 scaled = coord * size;\n"
               "    vec2 delta = max(abs(dFdx(scaled)), abs(dFdy(scaled)));\n"
-              "    return log2(max(delta.x, delta.y));\n"
+              "    float footprint = max(delta.x, delta.y);\n"
+              "    return footprint > 0.0 ? log2(footprint) : -128.0;\n"
               "}\n";
-    if (state.Textures[0].Type == 2U) {
-        source << Shadow2dHelpers(state);
+    if (integerTexture0) {
+        auto samplerState = state;
+        if (parametric) samplerState.Textures[0].Enabled = true;
+        source << Shadow2dHelpers(samplerState);
     } else {
         source << "vec4 pica_sample_texture0(vec2 coord) {\n"
                   "    float lod = pica_texture_lod(coord, vec2(textureSize(pica_texture0, 0)));\n"
@@ -729,6 +683,14 @@ bool GenerateOot3dPicaFragmentShader(
               "}\n";
     source << ShadowWriteHelpers(state);
     source << procTexSource;
+    if (parametric) {
+        source << Fast::Renderer3ds::PicaProcTexCode << Fast::Renderer3ds::PicaProcTexFragmentSampler;
+        source << (integerTexture0
+                       ? Fast::Renderer3ds::PicaIntegerTexture0Program
+                       : Fast::Renderer3ds::PicaFloatTexture0Program);
+        source << "vec4 pica_native_texture3() { return pica_sample_proctex(); }\n";
+        source << Fast::Renderer3ds::PicaTextureSelectionProgram;
+    }
     source << lightingDeclarations;
     hooks.Offsets[static_cast<size_t>(
         Oot3d::Renderer::PicaShaderHook::GlobalDeclarations)] =
@@ -737,7 +699,7 @@ bool GenerateOot3dPicaFragmentShader(
     hooks.Offsets[static_cast<size_t>(
         Oot3d::Renderer::PicaShaderHook::MainPrologue)] =
         StreamOffset(source);
-    source << "    vec4 rounded_primary_color = vec4(byteround3(pica_primary_color.rgb), byteround1(pica_primary_color.a));\n"
+    source << "    precise vec4 rounded_primary_color = vec4(byteround3(pica_primary_color.rgb), byteround1(pica_primary_color.a));\n"
               "    vec4 primary_fragment_color = vec4(0.0);\n"
               "    vec4 secondary_fragment_color = vec4(0.0);\n"
               "    vec4 combiner_buffer = vec4(0.0);\n"
@@ -835,30 +797,52 @@ bool GenerateOot3dPicaFragmentShader(
         const uint32_t alphaScaleBits = (scales >> 16U) & 3U;
         const uint32_t colorScale = colorScaleBits < 3U ? 1U << colorScaleBits : 1U;
         const uint32_t alphaScale = alphaScaleBits < 3U ? 1U << alphaScaleBits : 1U;
-        source << "    vec3 color_output_" << stage
-               << " = byteround3(clamp(" << colorResult
-               << ", vec3(0.0), vec3(1.0)));\n"
-               << "    float alpha_output_" << stage
-               << " = byteround1(clamp(" << alphaResult
-               << ", 0.0, 1.0));\n"
-               << "    combiner_output = vec4(clamp(color_output_" << stage
-               << " * " << colorScale
-               << ".0, vec3(0.0), vec3(1.0)), clamp(alpha_output_" << stage
-               << " * " << alphaScale << ".0, 0.0, 1.0));\n"
-               << "    combiner_buffer = next_combiner_buffer;\n";
-        if (stage < 4U &&
-            (packet.Registers[0x0E0U] & (1U << (8U + stage))) != 0U) {
-            source << "    next_combiner_buffer.rgb = combiner_output.rgb;\n";
-        }
-        if (stage < 4U &&
-            (packet.Registers[0x0E0U] & (1U << (12U + stage))) != 0U) {
-            source << "    next_combiner_buffer.a = combiner_output.a;\n";
+        if (!parametric) {
+            source << "    precise vec3 color_output_" << stage
+                   << " = byteround3(clamp(" << colorResult
+                   << ", vec3(0.0), vec3(1.0)));\n"
+                   << "    precise float alpha_output_" << stage
+                   << " = byteround1(clamp(" << alphaResult
+                   << ", 0.0, 1.0));\n"
+                   << "    combiner_output = vec4(clamp(color_output_" << stage
+                   << " * " << colorScale
+                   << ".0, vec3(0.0), vec3(1.0)), clamp(alpha_output_" << stage
+                   << " * " << alphaScale << ".0, 0.0, 1.0));\n"
+                   << "    combiner_buffer = next_combiner_buffer;\n";
+            if (stage < 4U &&
+                (packet.Registers[0x0E0U] & (1U << (8U + stage))) != 0U) {
+                source << "    next_combiner_buffer.rgb = combiner_output.rgb;\n";
+            }
+            if (stage < 4U &&
+                (packet.Registers[0x0E0U] & (1U << (12U + stage))) != 0U) {
+                source << "    next_combiner_buffer.a = combiner_output.a;\n";
+            }
         }
     }
     if (!supported) {
         SetError(error, DescribeUnsupportedTev(packet, state));
         return false;
     }
+
+    if (parametric) {
+        source << "    PicaTevInputs tev_inputs;\n"
+                  "    tev_inputs.primary = rounded_primary_color;\n"
+                  "    tev_inputs.primary_fragment = primary_fragment_color;\n"
+                  "    tev_inputs.secondary_fragment = secondary_fragment_color;\n"
+                  "    tev_inputs.buffer_color = fragment_uniforms.combiner_buffer_color;\n"
+                  "    for(int i=0;i<6;++i) tev_inputs.constants[i]=fragment_uniforms.tev_constants[i];\n";
+        // Fixed unit dispatch lets the GPU compiler eliminate irrelevant sampler paths.
+        for (unsigned unit = 0; unit < 4; ++unit) {
+            source << "    tev_inputs.textures[" << unit << "] = (fragment_uniforms.tev_program.control.y & "
+                   << (1U << unit) << "u) != 0u ? pica_native_texture(" << unit
+                   << "u, pica_texcoord0, pica_texcoord1, pica_texcoord2) : vec4(0.0);\n";
+        }
+        source << "    combiner_output = pica_evaluate_tev_resolved(fragment_uniforms.tev_program, tev_inputs);\n";
+        if (!supported) { SetError(error, "parametric TEV texture interface unsupported"); return false; }
+    }
+    hooks.Offsets[static_cast<size_t>(
+        Oot3d::Renderer::PicaShaderHook::AfterNativeTev)] =
+        StreamOffset(source);
 
     for (uint8_t texture = 0U;
          texture < hooks.TextureSamples.size(); ++texture) {
@@ -882,7 +866,15 @@ bool GenerateOot3dPicaFragmentShader(
     const uint32_t alphaTest = packet.Registers[0x104U];
     const bool alphaTestEnabled = (alphaTest & 1U) != 0U;
     const uint8_t alphaFunction = static_cast<uint8_t>((alphaTest >> 4U) & 7U);
-    if (alphaTestEnabled) {
+    if (parametric) {
+        source << "    if ((fragment_uniforms.fragment_control.y & 1u) != 0u) {\n"
+                  "        int alpha_byte = int(combiner_output.a * 255.0);\n"
+                  "        switch ((fragment_uniforms.fragment_control.y >> 4u) & 7u) {\n";
+        for (uint8_t function = 0; function < 8; ++function)
+            source << "        case " << unsigned(function) << "u: if ("
+                   << AlphaDiscardCondition(function) << ") discard; break;\n";
+        source << "        }\n    }\n";
+    } else if (alphaTestEnabled) {
         source << "    int alpha_byte = int(combiner_output.a * 255.0);\n"
                << "    if (" << AlphaDiscardCondition(alphaFunction)
                << ") discard;\n";
@@ -890,11 +882,31 @@ bool GenerateOot3dPicaFragmentShader(
     hooks.Offsets[static_cast<size_t>(
         Oot3d::Renderer::PicaShaderHook::BeforeDepth)] =
         StreamOffset(source);
-    source << "    float pica_z_over_w = -gl_FragCoord.z;\n"
-              "    float pica_depth = pica_z_over_w * fragment_uniforms.depth_scale + fragment_uniforms.depth_offset;\n"
-              "    if (fragment_uniforms.w_buffering != 0) pica_depth /= gl_FragCoord.w;\n";
-    if (fogMode == 5U) {
+    const bool rasterDepth = Oot3dPicaFragmentDepthIsRasterDepth(state, mode);
+    if (rasterDepth) {
+        source << "    float pica_z_over_w = -gl_FragCoord.z;\n"
+                  "    float pica_depth = gl_FragCoord.z;\n";
+    } else {
+        source << "    float pica_z_over_w = -gl_FragCoord.z;\n"
+                  "    float pica_depth = pica_z_over_w * fragment_uniforms.depth_scale + fragment_uniforms.depth_offset;\n"
+                  "    if (fragment_uniforms.w_buffering != 0) pica_depth /= gl_FragCoord.w;\n";
+    }
+    // The parametric program always provides fog_factor (1 when disabled).
+    // Hooks describe its interface, not the first material cached with it.
+    if (parametric || fogMode == 5U)
         hooks.Semantics |= Oot3d::Renderer::PicaShaderSemantic::NativeFogFactor;
+    if (parametric) {
+        source << "    float fog_factor = 1.0;\n"
+                  "    if ((fragment_uniforms.fragment_control.x & 7u) == 5u) {\n"
+                  "    float fog_index = ((fragment_uniforms.fragment_control.x & 65536u) != 0u ? (1.0 - pica_depth) : pica_depth) * 128.0;\n"
+                  "    float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n"
+                  "    int fog_entry_index = int(fog_i);\n"
+                  "    vec4 fog_pair = fragment_uniforms.fog_lut[fog_entry_index >> 1];\n"
+                  "    vec2 fog_entry = (fog_entry_index & 1) == 0 ? fog_pair.xy : fog_pair.zw;\n"
+                  "    fog_factor = clamp(fog_entry.x + fog_entry.y * (fog_index - fog_i), 0.0, 1.0);\n"
+                  "    combiner_output.rgb = mix(fragment_uniforms.fog_color.rgb, combiner_output.rgb, fog_factor);\n"
+                  "    }\n";
+    } else if (fogMode == 5U) {
         const bool fogFlip = (packet.Registers[0x0E0U] & (1U << 16U)) != 0U;
         source << "    float fog_index = "
                << (fogFlip ? "(1.0 - pica_depth)" : "pica_depth")
@@ -925,9 +937,9 @@ bool GenerateOot3dPicaFragmentShader(
             "    } while (true);\n"
             "    pica_color = vec4(0.0);\n";
     } else {
-        source <<
-            "    gl_FragDepth = pica_depth;\n"
-            "    pica_color = vec4(byteround3(combiner_output.rgb), byteround1(combiner_output.a));\n";
+        if (!rasterDepth)
+            source << "    gl_FragDepth = pica_depth;\n";
+        source << "    pica_color = vec4(byteround3(combiner_output.rgb), byteround1(combiner_output.a));\n";
     }
     hooks.Offsets[static_cast<size_t>(
         Oot3d::Renderer::PicaShaderHook::MainEpilogue)] =
@@ -936,12 +948,35 @@ bool GenerateOot3dPicaFragmentShader(
 
     if (purpose == Oot3dPicaShaderBuildPurpose::RuntimeDraw)
         shader.Uniforms = BuildOot3dPicaFragmentUniformState(packet);
-    shader.StateKey = ComputeOot3dPicaFragmentShaderStateKey(packet, state);
+    shader.StateKey = ComputeOot3dPicaFragmentShaderStateKey(packet, state, mode);
     shader.Source = source.str();
     shader.SourceIdentity =
         Oot3d::Renderer::IdentifyPicaShaderSource(shader.Source);
     hooks.SourceSize = shader.Source.size();
     return true;
+}
+
+bool GenerateOot3dPicaParametricBaseFragmentShader(
+    Oot3dPicaParametricLighting lighting, bool integerTexture0,
+    Oot3dPicaGeneratedFragmentShader& shader, std::string* error) {
+    auto packet = std::make_unique<Oot3dPicaDrawPacket>();
+    Oot3dPicaDecodedDrawState state{};
+    packet->Registers[0x8FU] = lighting != Oot3dPicaParametricLighting::Off ? 1U : 0U;
+    // Config1: every standard table (D0, D1, FR, RR, RG, RB) and every light's
+    // spot and distance attenuation disabled.
+    if (lighting == Oot3dPicaParametricLighting::NoLookupTables) packet->Registers[0x1C4U] = 0xFF7BFF00U;
+    packet->Registers[0x80U] = 1U;
+    packet->Registers[0x83U] = integerTexture0 ? 2U << 28U : 0U;
+    state.Textures[0].Enabled = true;
+    state.Textures[0].Type = integerTexture0 ? 2U : 0U;
+    if (lighting != Oot3dPicaParametricLighting::Off &&
+        Oot3dPicaFragmentLightingUsesLuts(*packet) != (lighting == Oot3dPicaParametricLighting::LookupTables)) {
+        if (error != nullptr) *error = "parametric lighting configuration does not select its lookup tables";
+        return false;
+    }
+    return GenerateOot3dPicaFragmentShader(*packet, state, shader, error,
+                                           Oot3dPicaShaderBuildPurpose::OfflineSource,
+                                           Oot3dPicaTevMode::Parametric);
 }
 
 } // namespace Oot3dNativeGame

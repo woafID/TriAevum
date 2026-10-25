@@ -38,7 +38,7 @@ def validate_installed_runtime(
             or not isinstance(arguments, list)
             or not all(isinstance(value, str) for value in arguments)):
         raise ValueError("Invalid installed launch profile")
-    arguments = [expand_profile_argument(argument, profile) for argument in arguments]
+    arguments = [expand_profile_argument(argument, profile, executable.parent) for argument in arguments]
     if "--title-plugin" in arguments:
         index = arguments.index("--title-plugin") + 1
         if (arguments.count("--title-plugin") != 1 or index >= len(arguments)
@@ -63,6 +63,9 @@ def validate_installed_runtime(
             load_json_object(expected)
     for field, option, label in (
         ("topscreen_textures", "--topscreen-texture-overrides", "TopScreen textures"),
+        ("water_textures", "--water-texture-catalog", "water texture catalog"),
+        ("scene_lights", "--scene-light-catalog", "scene light catalog"),
+        ("romfs_overlay", "--romfs-overlay", "RomFS mods"),
         ("pica_shader_pack", "--pica-aot-shader-pack", "PICA shader pack"),
     ):
         resource = runtime.get(field)
@@ -75,6 +78,17 @@ def validate_installed_runtime(
         if (index >= len(arguments) or Path(arguments[index]).resolve() != pack.resolve()
                 or not pack.is_file() or sha256_file(pack) != resource["sha256"]):
             raise ValueError(f"Installed {label} changed or are missing; run Forge again")
+    if "ui_texture_pack" in runtime:
+        option = "--ui-texture-pack"
+        resource = runtime["ui_texture_pack"]
+        pack = resolve_reference(resource["path"], title)
+        if arguments.count(option) != 1:
+            raise ValueError("Installed HD UI texture routing is missing or duplicated")
+        index = arguments.index(option) + 1
+        receipt = pack / "source.json"
+        if (index >= len(arguments) or Path(arguments[index]).resolve() != pack.resolve()
+                or not receipt.is_file() or sha256_file(receipt) != resource["receipt_sha256"]):
+            raise ValueError("Installed HD UI textures changed or are missing; run Forge again")
     if "renderer_cache" in runtime:
         option = "--renderer-cache-directory"
         expected = resolve_reference(runtime["renderer_cache"]["path"], title)

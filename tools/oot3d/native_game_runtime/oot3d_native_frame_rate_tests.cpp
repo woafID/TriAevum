@@ -154,29 +154,35 @@ void RunNativeFrameRateTests() {
         Oot3dNativeGame::ResolveDelayedVisualSampleAlpha(false, 2.0F), 1.0,
         "delayed visual interpolation did not clamp its upper bound");
 
+    // Fixed cadences end each transition on the completed source frame.
     Oot3dNativeGame::NativeVisualSampleCadence x2Cadence(2U);
-    ExpectNear(x2Cadence.Resolve(true, 0.91F), 0.0,
-               "x2 cadence did not start from the previous source frame");
-    ExpectNear(x2Cadence.Resolve(false, 0.13F), 0.5,
+    ExpectNear(x2Cadence.Resolve(false, 0.4F), 0.0,
+               "x2 cadence sampled before its first source frame");
+    ExpectNear(x2Cadence.Resolve(true, 0.91F), 0.5,
+               "x2 cadence did not start halfway to the new source frame");
+    ExpectNear(x2Cadence.Resolve(false, 0.13F), 1.0,
                "x2 cadence depended on wall-clock jitter");
-    ExpectNear(x2Cadence.Resolve(false, 0.97F), 0.5,
-               "x2 cadence advanced past its fixed sample lattice");
+    ExpectNear(x2Cadence.Resolve(false, 0.97F), 1.0,
+               "x2 cadence hold did not rest on the completed source frame");
     Oot3dNativeGame::NativeVisualSampleCadence x3Cadence(3U);
     constexpr std::array<float, 3> kExpectedX3Cadence{
-        0.0F, 1.0F / 3.0F, 2.0F / 3.0F};
+        1.0F / 3.0F, 2.0F / 3.0F, 1.0F};
     ExpectNear(x3Cadence.Resolve(true, 0.44F), kExpectedX3Cadence[0],
                "x3 cadence source boundary mismatch");
     ExpectNear(x3Cadence.Resolve(false, 0.02F), kExpectedX3Cadence[1],
                "x3 cadence first intermediate mismatch");
     ExpectNear(x3Cadence.Resolve(false, 0.99F), kExpectedX3Cadence[2],
-               "x3 cadence second intermediate mismatch");
-    ExpectNear(x3Cadence.Resolve(true, 0.5F), 0.0,
+               "x3 cadence did not end on the source frame");
+    ExpectNear(x3Cadence.Resolve(true, 0.5F), kExpectedX3Cadence[0],
                "x3 cadence did not reset on a new source frame");
     x3Cadence.Configure(2U);
-    ExpectNear(x3Cadence.Resolve(true, 1.0F), 0.0,
+    ExpectNear(x3Cadence.Resolve(true, 1.0F), 0.5,
                "fixed cadence mode change did not reset phase");
-    ExpectNear(x3Cadence.Resolve(false, 0.0F), 0.5,
+    ExpectNear(x3Cadence.Resolve(false, 0.0F), 1.0,
                "fixed cadence mode change retained the old multiplier");
+    Oot3dNativeGame::NativeVisualSampleCadence adaptiveCadence(0U);
+    ExpectNear(adaptiveCadence.Resolve(true, 0.7F), 0.0,
+               "adaptive cadence changed its source boundary");
 
     const auto native60 =
         Oot3dNativeGame::ResolveNativeFrameRateContract(
@@ -449,15 +455,63 @@ void RunNativeFrameRateTests() {
     const auto capturedClock = policy.GameplayClock().CaptureState();
     policy.ResetGameplayClock();
     if (policy.GameplayClock().Context().SimulationTick != 0U ||
-        !policy.RestoreGameplayClock(capturedClock) ||
+        !policy.RestoreGameplayClock(native60.Mode, capturedClock) ||
         policy.GameplayClock().Context().SimulationTick != 2U) {
         throw std::runtime_error("gameplay clock state restore mismatch");
     }
     auto invalidClock = capturedClock;
     invalidClock.CurrentLogicalFrame =
         invalidClock.PreviousLogicalFrame + 1.0;
-    if (policy.RestoreGameplayClock(invalidClock)) {
+    if (policy.RestoreGameplayClock(native60.Mode, invalidClock)) {
         throw std::runtime_error("invalid gameplay clock state was accepted");
+    }
+
+    for (const auto sourceMode : {
+             Oot3dNativeGame::GameplayTimingMode::Native30NoInterpolation,
+             Oot3dNativeGame::GameplayTimingMode::Native30Interpolated}) {
+        const auto destinationMode =
+            sourceMode ==
+                    Oot3dNativeGame::GameplayTimingMode::Native30NoInterpolation
+                ? Oot3dNativeGame::GameplayTimingMode::Native30Interpolated
+                : Oot3dNativeGame::GameplayTimingMode::Native30NoInterpolation;
+        Oot3dNativeGame::NativeGameplayClock sourceClock(
+            Oot3dNativeGame::ResolveNativeFrameRateContract(sourceMode, 60U));
+        sourceClock.Advance();
+        sourceClock.Advance();
+        Oot3dNativeGame::NativeFrameRatePolicy restoredPolicy(
+            Oot3dNativeGame::ResolveNativeFrameRateContract(destinationMode, 60U));
+        TestMemoryBus restoredMemory;
+        restoredMemory.Bytes[updateRate] = 2U;
+        if (!restoredPolicy.RestoreGameplayClock(
+                sourceMode, sourceClock.CaptureState()) ||
+            !restoredPolicy.ApplyNativeTimeScaleAtGameStateUpdate(
+                gameState, restoredMemory)) {
+            throw std::runtime_error(
+                "presentation-only mode change failed to resume gameplay");
+        }
+        const auto& next = restoredPolicy.GameplayClock().Context();
+        const auto& uninterrupted = sourceClock.Advance();
+        if (next.SimulationTick != uninterrupted.SimulationTick ||
+            next.CurrentLogicalFrame != uninterrupted.CurrentLogicalFrame ||
+            next.DeltaSeconds != uninterrupted.DeltaSeconds ||
+            restoredMemory.Bytes[updateRate] != 2U) {
+            throw std::runtime_error(
+                "presentation-only restore changed native gameplay progression");
+        }
+        const auto nativeState = restoredPolicy.GameplayClock().CaptureState();
+        if (restoredPolicy.RestoreGameplayClock(native60.Mode, capturedClock) ||
+            restoredPolicy.GameplayClock().Context().SimulationTick !=
+                nativeState.SimulationTick ||
+            restoredPolicy.GameplayClock().Context().CurrentLogicalFrame !=
+                nativeState.CurrentLogicalFrame ||
+            policy.RestoreGameplayClock(sourceMode, nativeState) ||
+            policy.GameplayClock().Context().SimulationTick !=
+                capturedClock.SimulationTick ||
+            policy.GameplayClock().Context().CurrentLogicalFrame !=
+                capturedClock.CurrentLogicalFrame) {
+            throw std::runtime_error(
+                "incompatible simulation restore changed a running clock");
+        }
     }
     const auto& stats = policy.Stats();
     if (stats.GameStateUpdatesObserved != 2U || stats.UpdateRateWrites != 1U ||

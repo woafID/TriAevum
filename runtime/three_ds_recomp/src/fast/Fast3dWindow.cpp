@@ -1,4 +1,5 @@
 #include "fast/Fast3dWindow.h"
+#include "fast/oot3d/graphics_settings_window.h"
 
 #include "ship/Context.h"
 #include "ship/utils/ShutdownRequest.h"
@@ -61,7 +62,14 @@ Fast3dWindow::Fast3dWindow() : Fast3dWindow(std::vector<std::shared_ptr<Ship::Gu
 Fast3dWindow::~Fast3dWindow() {
     SPDLOG_DEBUG("destruct fast3dwindow");
     sPressedKeys.clear();
-    mInterpreter->Destroy();
+    if (mInitialized) {
+        mInterpreter->Destroy();
+    } else if (mWindowManagerApi != nullptr) {
+        // Init() threw before the interpreter owned the backends (for example
+        // SDL could not open a display): only the window backend may hold
+        // partially created resources, and its teardown is null-safe.
+        mWindowManagerApi->Destroy();
+    }
     delete mRenderingApi;
     delete mWindowManagerApi;
 }
@@ -124,6 +132,7 @@ void Fast3dWindow::Init() {
 
     SetTextureFilter((FilteringMode)Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
         CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
+    mInitialized = true;
 }
 
 int32_t Fast3dWindow::GetTargetFps() {
@@ -452,7 +461,7 @@ bool Fast3dWindow::KeyDown(int32_t scancode) {
             WindowBackend::FAST3D_SDL_OOT3D_VULKAN &&
         scancode == Ship::KbScancode::LUS_KB_F2) {
         // Event-driven: keep short taps and reject key repeat, independent of guest/presentation rate.
-        if (firstPress) Oot3d::GraphicsSettingsRuntime::Instance().ToggleNativePresentationOverride();
+        if (firstPress) Oot3d::ToggleGraphicsNativePresentation();
         return true;
     }
 #endif

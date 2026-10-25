@@ -15,7 +15,8 @@ from typing import Any, Callable, Sequence
 try:
     from . import TOOL_VERSION
     from .product_contract import ensure_runtime_config, query_product
-    from .release_platform import WINDOWS, for_target, host_platform
+    from .release_platform import WINDOWS, for_target, host_platform, place_installed_runtime
+    from .host_layout import installation_state
     from .activation_transaction import activation_transaction
     from .installation_context import InstallationContext, resolve_reference
     from .toolchain_probe import probe_toolchain
@@ -23,6 +24,7 @@ try:
         distribution_path,
         distribution_root,
         installation_path,
+        installation_layout,
         activation_path,
     )
     from .common import (
@@ -58,11 +60,12 @@ try:
 except ImportError:
     from __init__ import TOOL_VERSION
     from product_contract import ensure_runtime_config, query_product
-    from release_platform import WINDOWS, for_target, host_platform
+    from release_platform import WINDOWS, for_target, host_platform, place_installed_runtime
+    from host_layout import installation_state
     from activation_transaction import activation_transaction
     from installation_context import InstallationContext, resolve_reference
     from toolchain_probe import probe_toolchain
-    from bundle_paths import distribution_path, distribution_root, installation_path, activation_path
+    from bundle_paths import distribution_path, distribution_root, installation_path, installation_layout, activation_path
     from common import (
         atomic_write_bytes,
         atomic_write_json,
@@ -161,7 +164,13 @@ def default_runtime_plugin_path() -> Path:
 
 
 def default_runtime_launch_profile_path() -> Path:
-    return activation_path("TriAevum.launch.json")
+    activation = installation_layout().activation
+    legacy = activation / "TriAevum.launch.json"
+    # An installation made before the profile moved to data/ keeps it: the
+    # runtime prefers a profile beside it, so a second one would go stale.
+    if legacy.is_file():
+        return legacy
+    return installation_state(activation) / legacy.name
 
 
 class HashCache:
@@ -268,7 +277,7 @@ def verify_sources(
     exheader_path: Path,
     romfs_path: Path,
     cache: HashCache,
-    topscreen_archive: Path | None = None,
+    ui_texture_archive: Path | None = None,
 ) -> tuple[dict[str, VerifiedInput], VerifiedInput | None]:
     contracts = recipe.get("inputs")
     if not isinstance(contracts, dict):
@@ -292,27 +301,23 @@ def verify_sources(
         verified[kind] = verify_input(kind, path, contract, cache)
 
     verified_mod: VerifiedInput | None = None
-    if topscreen_archive is not None:
-        optional = recipe.get("optional_inputs", {})
-        contract = (
-            optional.get("topscreen_2_1_1_archive")
-            if isinstance(optional, dict)
-            else None
-        )
-        if not isinstance(contract, dict):
-            raise ForgeError("revision recipe does not support a TopScreen archive")
-        resolved = topscreen_archive.expanduser().resolve()
+    if ui_texture_archive is not None:
+        try:
+            from .ui_texture_pack import pack_contract
+        except ImportError:
+            from ui_texture_pack import pack_contract
+        contract = pack_contract(recipe)
+        if contract is None:
+            raise ForgeError("revision recipe does not support the HD UI texture pack")
+        resolved = ui_texture_archive.expanduser().resolve()
         if not resolved.is_file() or resolved.is_symlink():
-            raise ForgeError(f"TopScreen archive is not a regular file: {resolved}")
+            raise ForgeError(f"HD UI texture pack archive is not a regular file: {resolved}")
         digest = cache.digest(resolved)
-        expected = str(contract.get("sha256", "")).lower()
-        if digest != expected:
+        if digest != contract.sha256:
             raise ForgeError(
-                f"TopScreen archive SHA-256 mismatch: expected {expected}, got {digest}"
+                f"HD UI texture pack archive SHA-256 mismatch: expected {contract.sha256}, got {digest}"
             )
-        verified_mod = VerifiedInput(
-            "topscreen_2_1_1_archive", resolved, resolved.stat().st_size, digest
-        )
+        verified_mod = VerifiedInput(contract.kind, resolved, resolved.stat().st_size, digest)
     cache.save()
     return verified, verified_mod
 
@@ -325,6 +330,39 @@ def content_key(recipe: dict[str, Any], verified: dict[str, VerifiedInput]) -> s
         digest.update(b"\0")
         digest.update(verified[kind].sha256.encode("ascii"))
     return digest.hexdigest()
+
+
+# Windows refuses longer paths unless long paths are enabled system-wide,
+# which TriAevum does not require (#103).
+WINDOWS_MAX_PATH = 259
+TITLE_DIRECTORY_KEY_DIGITS = 16
+MODULE_NAME_KEY_DIGITS = 32
+
+
+def title_directory(output_root: Path, recipe_id: str, key: str) -> Path:
+    """The title's folder: the content key's first 16 digits, or the full key
+    that installations made before 0.8.0-beta.1.2 already use."""
+    base = output_root.expanduser().resolve() / recipe_id
+    legacy = base / key
+    return legacy if legacy.is_dir() else base / key[:TITLE_DIRECTORY_KEY_DIGITS]
+
+
+def check_title_path_length(output_root: Path, recipe_ids: Sequence[str], *,
+                            windows: bool = os.name == "nt") -> None:
+    """Stop before any work when the deepest title file would not fit in a
+    Windows path (the precompiled module, titles/<id>/<key>/modules/<key>.tam)."""
+    if not windows:
+        return
+    base = output_root.expanduser().resolve()
+    longest = max(len(str(base / recipe_id / ("0" * TITLE_DIRECTORY_KEY_DIGITS) / "modules"
+                          / ("0" * MODULE_NAME_KEY_DIGITS + ".tam")))
+                  for recipe_id in recipe_ids)
+    if longest > WINDOWS_MAX_PATH:
+        raise ForgeError(
+            f"the TriAevum folder's path is too long for Windows: its files would need "
+            f"{longest} characters and Windows allows {WINDOWS_MAX_PATH}. Move the TriAevum "
+            f"folder to a path at least {longest - WINDOWS_MAX_PATH} characters shorter, "
+            f"such as D:\\Games\\TriAevum, and run Forge again.")
 
 
 def _build_process_manifest(
@@ -426,7 +464,7 @@ def prepare_content(
     process_manifest_builder: ProcessManifestBuilder | None = None,
 ) -> dict[str, Any]:
     key = content_key(recipe, verified)
-    title_root = output_root.expanduser().resolve() / str(recipe["id"]) / key
+    title_root = title_directory(output_root, str(recipe["id"]), key)
     index_path = title_root / "content.tap"
     state_path = title_root / "forge-state.json"
     process_manifest_path = title_root / "process-manifest.json"
@@ -841,6 +879,7 @@ def build_private_whole_aot(
     jobs: int = 8,
     sysroot: Path | None = None,
     target_triple: str = WINDOWS.target,
+    profile_data: Path | None = None,
 ) -> dict[str, Any]:
     """Build the direct generated-C++ plugin consumed by the mature runtime."""
     platform = for_target(target_triple)
@@ -882,6 +921,7 @@ def build_private_whole_aot(
                 sysroot=sysroot,
                 target_triple=platform.target,
                 profile=platform.profile,
+                profile_data=profile_data,
             ),
             shard_count=shard_count,
             jobs=jobs,
@@ -898,6 +938,7 @@ def build_private_whole_aot(
             "plugin_sha256",
             "cache_key",
             "translator_identity_sha256",
+            "profile_data_sha256",
             "functions",
             "shards",
             "objects_compiled",
@@ -908,6 +949,41 @@ def build_private_whole_aot(
     return result
 
 
+# The TopScreen layout F1 no longer offers: every installation uses the
+# standard profile's values. The HUD size keeps the user's choice when it is
+# one of the two F1 sizes.
+TOPSCREEN_STANDARD_LAYOUT_FIELDS = (
+    "hud_layout",
+    "hud_margin_x",
+    "hud_margin_y",
+    "magic_bar_y",
+    "dpad_offset_x",
+    "dpad_offset_y",
+    "dpad_size_percent",
+    "button_group_offset_x",
+    "button_group_offset_y",
+    "button_group_size_percent",
+    "render_hud",
+    "render_dpad_icons",
+    "render_items_hint",
+)
+TOPSCREEN_HUD_SIZES = (1.0, 0.7)
+
+
+def standard_topscreen_layout(user: dict[str, Any], standard: dict[str, Any]) -> dict[str, Any]:
+    """Return the user's TopScreen file with the standard profile's layout."""
+
+    if user.get("schema") != standard.get("schema"):
+        return user
+    migrated = dict(user)
+    for field in TOPSCREEN_STANDARD_LAYOUT_FIELDS:
+        migrated[field] = standard[field]
+    scale = user.get("hud_scale")
+    if not isinstance(scale, (int, float)) or not any(abs(scale - size) < 1.0e-6 for size in TOPSCREEN_HUD_SIZES):
+        migrated["hud_scale"] = standard["hud_scale"]
+    return migrated
+
+
 def publish_private_runtime(
     prepared_directory: Path,
     *,
@@ -916,6 +992,12 @@ def publish_private_runtime(
     launch_profile: Path,
     data_root: Path,
     topscreen_texture_pack: Path | None = None,
+    topscreen_link_animations: Path | None = None,
+    topscreen_ui_atlas_hd: Path | None = None,
+    ui_texture_pack: Path | None = None,
+    water_texture_catalog: Path | None = None,
+    scene_light_catalog: Path | None = None,
+    romfs_overlay: Path | None = None,
     package_root: Path | None = None,
     pica_shader_pack: Path | None = None,
     renderer_cache_directory: Path | None = None,
@@ -937,7 +1019,9 @@ def publish_private_runtime(
     destination = installation / "private-plugins" / plugin_hash / platform.title_module
     profile_path = launch_profile.expanduser().resolve()
     private_root = data_root.expanduser().resolve()
-    product_receipt = query_product(package / platform.runtime)
+    # Installing a title places the runtime in the installation root.
+    runtime_executable = place_installed_runtime(package, platform)
+    product_receipt = query_product(runtime_executable)
     destination.parent.mkdir(parents=True, exist_ok=True)
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     private_root.mkdir(parents=True, exist_ok=True)
@@ -949,13 +1033,18 @@ def publish_private_runtime(
     for user_config in (topscreen_config, runtime_config):
         if user_config.exists():
             load_json_object(user_config)
+    source_config = distribution_path("config/topscreen_ui.example.json")
+    try:
+        standard_topscreen = load_json_object(source_config)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ForgeError(f"default TopScreen configuration is invalid: {exc}") from exc
     if not topscreen_config.is_file():
-        source_config = distribution_path("config/topscreen_ui.example.json")
-        try:
-            payload = load_json_object(source_config)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise ForgeError(f"default TopScreen configuration is invalid: {exc}") from exc
-        atomic_write_json(topscreen_config, payload)
+        atomic_write_json(topscreen_config, standard_topscreen)
+    else:
+        user_topscreen = load_json_object(topscreen_config)
+        migrated = standard_topscreen_layout(user_topscreen, standard_topscreen)
+        if migrated != user_topscreen:
+            atomic_write_json(topscreen_config, migrated)
 
     ensure_runtime_config(runtime_config, product_receipt["product"])
     savedata = private_root / "savedata"
@@ -996,6 +1085,32 @@ def publish_private_runtime(
         if not topscreen_texture_pack.is_file():
             raise ForgeError("TopScreen texture pack is missing before activation")
         profile["arguments"].extend(("--topscreen-texture-overrides", str(topscreen_texture_pack.resolve())))
+    if topscreen_link_animations is not None:
+        if not topscreen_link_animations.is_file():
+            raise ForgeError("SingleScreen 3.0 Link animations are missing before activation")
+        profile["arguments"].extend(("--topscreen-link-animations", str(topscreen_link_animations.resolve())))
+    if topscreen_ui_atlas_hd is not None:
+        if not topscreen_ui_atlas_hd.is_file():
+            raise ForgeError("HD UI atlas is missing before activation")
+        profile["arguments"].extend(("--topscreen-ui-atlas-hd", str(topscreen_ui_atlas_hd.resolve())))
+    ui_texture_receipt = None
+    if ui_texture_pack is not None:
+        ui_texture_receipt = ui_texture_pack / "source.json"
+        if not ui_texture_receipt.is_file() or not (ui_texture_pack / "common").is_dir():
+            raise ForgeError("HD UI texture pack is missing before activation")
+        profile["arguments"].extend(("--ui-texture-pack", str(ui_texture_pack.resolve())))
+    if water_texture_catalog is not None:
+        if not water_texture_catalog.is_file():
+            raise ForgeError("Water texture catalog is missing before activation")
+        profile["arguments"].extend(("--water-texture-catalog", str(water_texture_catalog.resolve())))
+    if scene_light_catalog is not None:
+        if not scene_light_catalog.is_file():
+            raise ForgeError("Scene light catalog is missing before activation")
+        profile["arguments"].extend(("--scene-light-catalog", str(scene_light_catalog.resolve())))
+    if romfs_overlay is not None:
+        if not romfs_overlay.is_file():
+            raise ForgeError("RomFS mod overlay is missing before activation")
+        profile["arguments"].extend(("--romfs-overlay", str(romfs_overlay.resolve())))
     context = InstallationContext(installation)
     if pica_shader_pack is not None:
         if not pica_shader_pack.is_file():
@@ -1005,12 +1120,15 @@ def publish_private_runtime(
         profile["arguments"].extend(("--renderer-cache-directory", str(renderer_cache_directory.resolve())))
     path_options = {"--title-plugin", "--a32-process-manifest", "--resource-root",
                     "--config", "--topscreen-config", "--save-data", "--output",
-                    "--topscreen-texture-overrides", "--pica-aot-shader-pack", "--renderer-cache-directory"}
+                    "--topscreen-texture-overrides", "--topscreen-link-animations",
+                    "--topscreen-ui-atlas-hd", "--ui-texture-pack",
+                    "--water-texture-catalog", "--scene-light-catalog", "--romfs-overlay",
+                    "--pica-aot-shader-pack", "--renderer-cache-directory"}
     scopes = {}
     for index, argument in enumerate(profile["arguments"][:-1]):
         if argument in path_options:
             target = Path(profile["arguments"][index + 1])
-            profile["arguments"][index + 1] = context.profile_argument(target, profile_path)
+            profile["arguments"][index + 1] = context.profile_argument(target, profile_path, runtime_dir=package)
             scopes[argument] = context.scope(target, profile_path.parent)
     profile["path_scopes"] = scopes
     if not destination.is_file() or sha256_file(destination) != plugin_hash:
@@ -1026,7 +1144,7 @@ def publish_private_runtime(
             temporary.unlink(missing_ok=True)
     # Query the exact immutable generation in a short-lived process before the
     # single launch-profile replacement makes it visible to direct launches.
-    query_product(package / platform.runtime, plugin=destination)
+    query_product(runtime_executable, plugin=destination)
     atomic_write_json(profile_path, profile)
     prepared.state["runtime"] = {
         "status": "ready",
@@ -1046,6 +1164,38 @@ def publish_private_runtime(
         prepared.state["runtime"]["topscreen_textures"] = {
             "path": context.reference(topscreen_texture_pack, prepared.directory),
             "sha256": sha256_file(topscreen_texture_pack),
+        }
+    if topscreen_link_animations is not None:
+        prepared.state["runtime"]["topscreen_link_animations"] = {
+            "path": context.reference(topscreen_link_animations, prepared.directory),
+            "sha256": sha256_file(topscreen_link_animations),
+        }
+    if topscreen_ui_atlas_hd is not None:
+        prepared.state["runtime"]["topscreen_ui_atlas_hd"] = {
+            "path": context.reference(topscreen_ui_atlas_hd, prepared.directory),
+            "sha256": sha256_file(topscreen_ui_atlas_hd),
+        }
+    if ui_texture_receipt is not None:
+        # A directory: its receipt is pinned; the textures were verified when
+        # the pack was prepared.
+        prepared.state["runtime"]["ui_texture_pack"] = {
+            "path": context.reference(ui_texture_pack, prepared.directory),
+            "receipt_sha256": sha256_file(ui_texture_receipt),
+        }
+    if water_texture_catalog is not None:
+        prepared.state["runtime"]["water_textures"] = {
+            "path": context.reference(water_texture_catalog, prepared.directory),
+            "sha256": sha256_file(water_texture_catalog),
+        }
+    if scene_light_catalog is not None:
+        prepared.state["runtime"]["scene_lights"] = {
+            "path": context.reference(scene_light_catalog, prepared.directory),
+            "sha256": sha256_file(scene_light_catalog),
+        }
+    if romfs_overlay is not None:
+        prepared.state["runtime"]["romfs_overlay"] = {
+            "path": context.reference(romfs_overlay, prepared.directory),
+            "sha256": sha256_file(romfs_overlay),
         }
     if pica_shader_pack is not None:
         prepared.state["runtime"]["pica_shader_pack"] = {
@@ -1142,7 +1292,7 @@ def package_private_module(
     # Keep paths comfortably below legacy Win32 limits even when the title
     # cache root already contains a recipe ID and full content hash. The full
     # cache key and all constituent identities remain in forge-state.json.
-    relative_module = Path("modules") / f"{module_cache_key[:32]}.tam"
+    relative_module = Path("modules") / f"{module_cache_key[:MODULE_NAME_KEY_DIGITS]}.tam"
     module_path = title_root / relative_module
     module_hash = hashlib.sha256(module).hexdigest()
     module_state = {
@@ -1215,6 +1365,7 @@ def build_private_title(
     shard_count: int = 256,
     jobs: int = 8,
     sysroot: Path | None = None,
+    profile_data: Path | None = None,
 ) -> dict[str, Any]:
     prepared = load_prepared_content(
         prepared_directory, required_inputs=("code", "exheader")
@@ -1237,6 +1388,7 @@ def build_private_title(
         target_triple=target_triple,
         shard_count=shard_count,
         jobs=jobs,
+        profile_data=profile_data,
     )
     with activation_transaction(runtime_plugin.resolve().parent, [
         runtime_plugin, launch_profile, active_title_state,
@@ -1276,7 +1428,7 @@ def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--code", type=Path, required=True)
     parser.add_argument("--exheader", type=Path, required=True)
     parser.add_argument("--romfs", type=Path, required=True)
-    parser.add_argument("--topscreen-archive", type=Path)
+    parser.add_argument("--ui-texture-archive", type=Path)
     parser.add_argument("--output-root", type=Path, default=default_output_root())
     parser.add_argument(
         "--rehash",
@@ -1408,6 +1560,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     title_parser.add_argument("--jobs", type=int, default=8)
     title_parser.add_argument("--sysroot", type=Path,
                               help="Use a verified private Windows sysroot instead of host discovery")
+    title_parser.add_argument(
+        "--profile-data", type=Path,
+        help="Developer PGO: merged LLVM profile applied to the title module")
     title_parser.add_argument(
         "--target-triple", default=host_platform().target
     )
@@ -1575,10 +1730,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_count=args.shards,
                 jobs=args.jobs,
                 sysroot=args.sysroot,
+                profile_data=args.profile_data,
             )
         else:
             recipe = load_recipe(args.recipes, args.recipe)
             output_root = args.output_root.expanduser().resolve()
+            if args.command != "verify":
+                check_title_path_length(output_root, [str(recipe["id"])])
             cache = HashCache(output_root / ".hash-cache.json", enabled=not args.rehash)
             verified, verified_mod = verify_sources(
                 recipe,
@@ -1586,7 +1744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exheader_path=args.exheader,
                 romfs_path=args.romfs,
                 cache=cache,
-                topscreen_archive=args.topscreen_archive,
+                ui_texture_archive=args.ui_texture_archive,
             )
             if args.command == "verify":
                 result = {

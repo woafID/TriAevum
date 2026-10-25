@@ -1,4 +1,5 @@
 #include "oot3d_native_a32_process.h"
+#include "oot3d_cpu_phase_probe.h"
 
 #include "oot3d_native_compiled_functions.h"
 
@@ -331,8 +332,18 @@ std::optional<uint32_t> NativeA32Process::CreateThread(
     constexpr size_t kTlsEntrySize = 0x200U;
     if (mNextTlsOffset > mTlsSize ||
         kTlsEntrySize > mTlsSize - mNextTlsOffset) {
-        SetError(error, "native A32 process has no free TLS entry");
-        return std::nullopt;
+        // CTR allocates another page when its eight TLS slots are exhausted.
+        // Keep old slots at stable addresses, including restored checkpoints.
+        constexpr size_t kTlsPageSize = 0x1000U;
+        const uint64_t nextPage = uint64_t(mTlsBaseAddress) + mTlsSize;
+        if (mNextTlsOffset != mTlsSize || mTlsSize % kTlsPageSize != 0 ||
+            nextPage + kTlsPageSize > uint64_t(UINT32_MAX) + 1 ||
+            !mMemory.MapRegion({"thread_tls", static_cast<uint32_t>(nextPage),
+                                kTlsPageSize, true, false, {}}, error)) {
+            SetError(error, "native A32 process cannot allocate another TLS page");
+            return std::nullopt;
+        }
+        mTlsSize += kTlsPageSize;
     }
     const uint32_t threadPointer =
         mTlsBaseAddress + static_cast<uint32_t>(mNextTlsOffset);
@@ -383,6 +394,25 @@ bool NativeA32Process::HasReadyThread() const {
         }
     }
     return false;
+}
+
+bool NativeA32Process::OnlyBackgroundThreadsReady() const {
+    if (mPrimaryThreadStatus != NativeA32ThreadStatus::Waiting) return false;
+    for (const auto& thread : mSecondaryThreads) {
+        if ((thread.Status == NativeA32ThreadStatus::Ready ||
+             thread.Status == NativeA32ThreadStatus::Running) &&
+            thread.Priority <= mPrimaryThreadPriority) return false;
+    }
+    return true;
+}
+
+uint32_t NativeA32Process::DispatchBlockBudget(uint32_t requested) const {
+    // Polling workers must not consume a foreground-sized quantum while all
+    // foreground work waits on host events. Preserve their PC and resume them
+    // after event delivery; this changes no guest clocks or thread priorities.
+    constexpr uint32_t backgroundQuantum = 10'000U;
+    return OnlyBackgroundThreadsReady() ? std::min(requested, backgroundQuantum)
+                                       : requested;
 }
 
 bool NativeA32Process::SelectReadyThread() {
@@ -500,6 +530,7 @@ NativeA32ProcessRunResult NativeA32Process::ApplyHostResult(
 
 NativeA32ProcessRunResult NativeA32Process::Run(
     uint32_t blockLimitPerDispatch, uint32_t maxHostTransitions) {
+    CpuPhaseProbe::Scope cpuRun(CpuPhaseProbe::Phase::GuestScheduler);
     if (mTimingEnabled) {
         ++mTimingStats.ProcessRunCalls;
     }
@@ -523,13 +554,15 @@ NativeA32ProcessRunResult NativeA32Process::Run(
          ++transitions) {
         mPendingFallback = {};
         auto& state = CurrentThreadState();
+        const uint32_t dispatchBudget = DispatchBlockBudget(blockLimitPerDispatch);
         const auto dispatchStart = mTimingEnabled
                                        ? TimingClock::now()
                                        : TimingClock::time_point{};
+        CpuPhaseProbe::Scope cpuDispatch(CpuPhaseProbe::Phase::Aot);
         const auto exit =
 #if defined(OOT3D_WHOLE_AOT_PRODUCT_MODE)
             DispatchWholeAotProduct(
-                state, mMemory, blockLimitPerDispatch,
+                state, mMemory, dispatchBudget,
                 mBlockEntryCallback, mBlockEntryUser,
                 mBlockEntryFilterPcs.data(), mBlockEntryFilterPcs.size(), std::nullopt,
                 mNativeBlockCallback, mNativeBlockUser);
@@ -537,12 +570,13 @@ NativeA32ProcessRunResult NativeA32Process::Run(
             oot3d::recomp::a32::Dispatch(
             mRegistry, state.r[15], state, mMemory,
             &NativeA32Process::DispatchFallback, this,
-            blockLimitPerDispatch, mBlockEntryCallback, mBlockEntryUser,
+            dispatchBudget, mBlockEntryCallback, mBlockEntryUser,
             mBlockEntryFilterPcs.data(), mBlockEntryFilterPcs.size(),
             mNativeFunctionCallback, mNativeFunctionUser,
             mNativeFunctionPcs.data(), mNativeFunctionPcs.size(),
             mNativeBlockCallback, mNativeBlockUser);
 #endif
+        cpuDispatch.Stop();
         if (mTimingEnabled) {
             ++mTimingStats.DispatchCalls;
             mTimingStats.DispatchNanoseconds +=
@@ -561,9 +595,8 @@ NativeA32ProcessRunResult NativeA32Process::Run(
                     SelectReadyThread()) {
                     continue;
                 }
-                if (AllThreadsTerminated()) {
-                    result.Kind = NativeA32ProcessRunKind::Terminated;
-                }
+                result.Kind = ResolveStoppedThreadRunKind(
+                    result.Kind, AllThreadsTerminated());
                 return result;
             }
             SelectReadyThread();
@@ -575,8 +608,10 @@ NativeA32ProcessRunResult NativeA32Process::Run(
             const auto svcStart = mTimingEnabled
                                       ? TimingClock::now()
                                       : TimingClock::time_point{};
+            CpuPhaseProbe::Scope cpuSvc(CpuPhaseProbe::Phase::Svc);
             auto hostResult =
                 mHostServices.HandleSvc(exit.detail, state, mMemory, context);
+            cpuSvc.Stop();
             if (mTimingEnabled) {
                 ++mTimingStats.SvcCalls;
                 const uint64_t nanoseconds = ElapsedNanoseconds(svcStart);
@@ -596,9 +631,8 @@ NativeA32ProcessRunResult NativeA32Process::Run(
                     SelectReadyThread()) {
                     continue;
                 }
-                if (AllThreadsTerminated()) {
-                    result.Kind = NativeA32ProcessRunKind::Terminated;
-                }
+                result.Kind = ResolveStoppedThreadRunKind(
+                    result.Kind, AllThreadsTerminated());
                 return result;
             }
             SelectReadyThread();
@@ -672,6 +706,7 @@ bool NativeA32Process::InvokeFunctionWithState(
     uint32_t entryAddress, oot3d::recomp::a32::GuestState& state,
     uint32_t returnAddress, std::string* error,
     uint32_t blockLimitPerDispatch, uint32_t maxHostTransitions) {
+    CpuPhaseProbe::Scope cpuInvoke(CpuPhaseProbe::Phase::GuestScheduler);
     if (!mMemory.IsExecutable(entryAddress, 1U)) {
         SetError(error, "native A32 function entry is not executable");
         return false;
@@ -702,6 +737,7 @@ bool NativeA32Process::InvokeFunctionWithState(
 
     for (uint32_t transition = 0U; transition < maxHostTransitions;
          ++transition) {
+        CpuPhaseProbe::Scope cpuDispatch(CpuPhaseProbe::Phase::Aot);
         const auto exit =
 #if defined(OOT3D_WHOLE_AOT_PRODUCT_MODE)
             DispatchWholeAotProduct(
@@ -718,6 +754,7 @@ bool NativeA32Process::InvokeFunctionWithState(
             invokeCallbackPcs.data(), invokeCallbackPcs.size(),
             mNativeBlockCallback, mNativeBlockUser);
 #endif
+        cpuDispatch.Stop();
 #if defined(OOT3D_WHOLE_AOT_PRODUCT_MODE)
         if ((exit.kind == oot3d::recomp::a32::ExitKind::Branch ||
              exit.kind == oot3d::recomp::a32::ExitKind::Fallthrough) &&
@@ -732,8 +769,10 @@ bool NativeA32Process::InvokeFunctionWithState(
 #endif
         if (exit.kind == oot3d::recomp::a32::ExitKind::Svc) {
             NativeA32HostContext context{*this, mCurrentThreadId};
+            CpuPhaseProbe::Scope cpuSvc(CpuPhaseProbe::Phase::Svc);
             auto hostResult =
                 mHostServices.HandleSvc(exit.detail, state, mMemory, context);
+            cpuSvc.Stop();
             if (hostResult.Action == NativeA32HostAction::Resume) {
                 state.r[15] = hostResult.ResumePc.value_or(exit.pc + 4U);
                 continue;
@@ -857,7 +896,7 @@ NativeA32ProcessTimingStats NativeA32Process::TimingStats() const noexcept {
     return mTimingStats;
 }
 
-uint64_t NativeA32Process::StateFingerprint() const noexcept {
+uint64_t NativeA32Process::StateFingerprint() const {
     uint64_t hash = mMemory.StateFingerprint();
     const auto append = [&](const void* data, size_t size) {
         const auto* bytes = static_cast<const uint8_t*>(data);
@@ -1023,9 +1062,11 @@ bool NativeA32Process::RestoreState(const nlohmann::json& state,
         const size_t tlsSize = state.at("tls_size").get<size_t>();
         const size_t nextTlsOffset =
             state.at("next_tls_offset").get<size_t>();
-        if (nextTlsOffset > tlsSize ||
-            (tlsSize != 0U &&
-             !stagedMemory.IsMapped(tlsBaseAddress, tlsSize))) {
+        bool tlsMapped = tlsSize == 0U || RangeFits(tlsBaseAddress, tlsSize);
+        for (size_t offset = 0; tlsMapped && offset < tlsSize; offset += 0x200U)
+            tlsMapped = stagedMemory.IsWritable(tlsBaseAddress + static_cast<uint32_t>(offset),
+                                                std::min(size_t(0x200U), tlsSize - offset));
+        if (nextTlsOffset > tlsSize || !tlsMapped) {
             SetError(error, "native A32 TLS state is invalid");
             return false;
         }
@@ -1061,6 +1102,7 @@ bool NativeA32Process::RestoreState(const nlohmann::json& state,
         pendingFallback.Exit.detail =
             encodedFallback.at("exit_detail").get<uint32_t>();
 
+        stagedMemory.PreserveAccessObserversFrom(mMemory);
         mMemory = std::move(stagedMemory);
         mPrimaryThreadState = primaryState;
         mPrimaryThreadStatus = primaryStatus;

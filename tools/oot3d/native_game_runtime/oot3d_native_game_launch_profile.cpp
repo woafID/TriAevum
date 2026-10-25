@@ -5,6 +5,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include <SDL.h>
 #include <nlohmann/json.hpp>
 
 namespace Oot3dNativeGame {
@@ -42,7 +43,15 @@ std::filesystem::path DefaultNativeGameLaunchProfilePath(
     resolved = resolved.lexically_normal();
     auto profileName = resolved.filename();
     profileName.replace_extension(".launch.json");
-    return resolved.parent_path() / profileName;
+    // Beside the executable, or in the installation's data/ (the Windows
+    // package keeps only the executables, README and LICENSE in its root).
+    const auto beside = resolved.parent_path() / profileName;
+    const auto inData = resolved.parent_path() / "data" / profileName;
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(beside, error) &&
+        std::filesystem::is_regular_file(inData, error))
+        return inData;
+    return beside;
 }
 
 std::vector<std::string> LoadNativeGameLaunchProfile(
@@ -75,6 +84,15 @@ std::vector<std::string> LoadNativeGameLaunchProfile(
         {"profile_dir", resolvedPath.parent_path().generic_string()},
         {"executable_dir", resolvedPath.parent_path().generic_string()},
     };
+    // The running executable's own directory: files of its package are named
+    // from it, because an AppImage is mounted at a new path on every launch.
+    if (char* base = SDL_GetBasePath(); base != nullptr) {
+        std::filesystem::path runtimeDirectory(base);
+        SDL_free(base);
+        variables["runtime_dir"] = runtimeDirectory.lexically_normal().generic_string();
+        while (!variables["runtime_dir"].empty() && variables["runtime_dir"].back() == '/')
+            variables["runtime_dir"].pop_back();
+    }
     if (const auto variablesIt = document.find("variables");
         variablesIt != document.end()) {
         if (!variablesIt->is_object()) {

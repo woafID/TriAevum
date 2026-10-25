@@ -26,6 +26,9 @@ namespace {
 
 constexpr uint32_t kFrameSlots = 2U;
 constexpr uint32_t kBytesPerPixel = 4U;
+// The largest nonCoherentAtomSize Vulkan permits; flushed ranges and buffer
+// capacities are multiples of it.
+constexpr uint64_t kFlushAtom = 256U;
 
 } // namespace
 
@@ -55,8 +58,9 @@ struct NriPicaTextureUploadPass::Impl {
 
     bool CreateUploadBuffer(uint64_t capacity, UploadBuffer& upload) {
         if (Core == nullptr || Device == nullptr || capacity == 0U ||
-            capacity > std::numeric_limits<size_t>::max())
+            capacity > std::numeric_limits<size_t>::max() - kFlushAtom)
             return false;
+        capacity = (capacity + kFlushAtom - 1U) / kFlushAtom * kFlushAtom;
         nri::BufferDesc bufferDesc{};
         bufferDesc.size = capacity;
         if (Core->CreateCommittedBuffer(
@@ -72,6 +76,17 @@ struct NriPicaTextureUploadPass::Impl {
         }
         upload.Capacity = capacity;
         return true;
+    }
+
+    // The mapping is persistent, so host writes reach the GPU copy only after
+    // a flush when NRI placed the buffer in non-coherent memory. NRI's Unmap
+    // flushes the last mapped range there and does nothing on coherent memory.
+    void Publish(UploadBuffer& upload, uint64_t begin, uint64_t end) {
+        begin = begin / kFlushAtom * kFlushAtom;
+        end = std::min(upload.Capacity,
+                       (end + kFlushAtom - 1U) / kFlushAtom * kFlushAtom);
+        Core->MapBuffer(*upload.Buffer, begin, end - begin);
+        Core->UnmapBuffer(*upload.Buffer);
     }
 
     void DestroyUploadBuffer(UploadBuffer& upload) {
@@ -175,8 +190,11 @@ bool NriPicaTextureUploadPass::Execute(
         desc.Height == 0U || desc.MipLevels == 0U ||
         desc.MipLevel >= desc.MipLevels)
         return false;
+    const uint32_t rows = desc.RowCount != 0U ? desc.RowCount : desc.Height;
+    if (desc.RowOffset > desc.Height || rows > desc.Height - desc.RowOffset)
+        return false;
     const uint64_t pixelCount =
-        static_cast<uint64_t>(desc.Width) * desc.Height;
+        static_cast<uint64_t>(desc.Width) * rows;
     if (pixelCount >
             std::numeric_limits<uint64_t>::max() / kBytesPerPixel ||
         pixelCount * kBytesPerPixel != desc.Pixels.size())
@@ -193,7 +211,7 @@ bool NriPicaTextureUploadPass::Execute(
     std::optional<PicaNriTextureUploadLayout> layout;
     for (auto& candidate : frame.Buffers) {
         const auto candidateLayout = PlanPicaNriTextureUpload(
-            candidate.Used, candidate.Capacity, desc.Width, desc.Height,
+            candidate.Used, candidate.Capacity, desc.Width, rows,
             kBytesPerPixel, mImpl->RowAlignment, mImpl->SliceAlignment);
         if (candidateLayout.has_value()) {
             upload = &candidate;
@@ -204,7 +222,7 @@ bool NriPicaTextureUploadPass::Execute(
     if (upload == nullptr) {
         const auto required = PlanPicaNriTextureUpload(
             0U, std::numeric_limits<uint64_t>::max(),
-            desc.Width, desc.Height, kBytesPerPixel,
+            desc.Width, rows, kBytesPerPixel,
             mImpl->RowAlignment, mImpl->SliceAlignment);
         if (!required.has_value())
             return false;
@@ -218,17 +236,18 @@ bool NriPicaTextureUploadPass::Execute(
         }
         upload = &frame.Buffers.back();
         layout = PlanPicaNriTextureUpload(
-            0U, upload->Capacity, desc.Width, desc.Height,
+            0U, upload->Capacity, desc.Width, rows,
             kBytesPerPixel, mImpl->RowAlignment, mImpl->SliceAlignment);
         if (!layout.has_value())
             return false;
     }
     if (!PackPicaNriTextureUpload(
-            desc.Pixels, desc.Width, desc.Height, kBytesPerPixel,
+            desc.Pixels, desc.Width, rows, kBytesPerPixel,
             *layout, std::span<uint8_t>(
                          upload->Mapped,
                          static_cast<size_t>(upload->Capacity))))
         return false;
+    mImpl->Publish(*upload, layout->Offset, layout->RequiredSize);
 
     nri::CommandBuffer* command = NriInteropAccess::CommandBuffer(
         *mImpl->Interop, desc.FrameIndex);
@@ -261,7 +280,8 @@ bool NriPicaTextureUploadPass::Execute(
 
     nri::TextureRegionDesc region{};
     region.width = static_cast<nri::Dim_t>(desc.Width);
-    region.height = static_cast<nri::Dim_t>(desc.Height);
+    region.y = static_cast<nri::Dim_t>(desc.RowOffset);
+    region.height = static_cast<nri::Dim_t>(rows);
     region.depth = 1;
     region.mipOffset = static_cast<nri::Dim_t>(desc.MipLevel);
     region.planes = nri::PlaneBits::COLOR;

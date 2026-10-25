@@ -170,8 +170,10 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         sinks.push_back(systemConsoleSink);
 #endif
 
-        auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
-        auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
+        // The short name: the display name may hold spaces and non-ASCII text.
+        auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetShortName() + ".log"));
+        // Each launch starts a fresh file; earlier launches stay as .1, .2, ...
+        auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10, true);
         sinks.push_back(fileSink);
 #ifdef _DEBUG
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
@@ -339,7 +341,15 @@ bool Context::InitWindow(std::shared_ptr<Window> window) {
         return false;
     }
 
-    GetWindow()->Init();
+    try {
+        GetWindow()->Init();
+    } catch (...) {
+        // The window never became usable: do not keep it as the context's
+        // window, or the destructor would save its geometry and tear down
+        // backends that were never created.
+        mWindow = nullptr;
+        throw;
+    }
 
     return true;
 }

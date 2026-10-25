@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -123,9 +124,228 @@ void TestVirtualMotion() {
             "virtual motion changed physical controller sensors");
 }
 
+bool NearVector(const std::array<float, 3>& a, const std::array<float, 3>& b, float tolerance = 1e-5F) {
+    for (int i = 0; i < 3; ++i) if (std::abs(a[i] - b[i]) > tolerance) return false;
+    return true;
+}
+
+void TestAutomaticMotionComposition() {
+    using namespace ThreeDsRecomp::Input;
+    MappingConfig config;
+    config.NativeMotionSource = MotionSource::Automatic;
+    config.CStickSource = MotionSource::Automatic;
+    VirtualMotionState state;
+    PhysicalInputState input;
+    input.ControllerMotion.GyroscopeValid = input.ControllerMotion.AccelerometerValid = true;
+    input.ControllerMotion.Accelerometer = {0, -1, 0};
+    input.ControllerMotion.GyroscopeDegreesPerSecond = {12, 0, 0};
+    input.RightStickY = 20000;
+    const auto mixed = ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    auto justStickInput = input;
+    justStickInput.ControllerMotion.GyroscopeDegreesPerSecond = {};
+    VirtualMotionState justStickState;
+    const auto justStick = ResolveInput(config, justStickInput, {}, {}, nullptr, true, &justStickState);
+    Require(std::abs(mixed.Hid.GyroscopeDegreesPerSecond[0] - justStick.Hid.GyroscopeDegreesPerSecond[0] - 12) < 1e-4F,
+            "stick swallowed gyro instead of composing rates");
+    input.RightStickY = 0;
+    input.ControllerMotion.GyroscopeDegreesPerSecond = {};
+    for (int i = 0; i < 300; ++i) {
+        const auto idle = ResolveInput(config, input, {}, {}, nullptr, true, &state);
+        Require(NearVector(idle.Hid.Accelerometer, mixed.Hid.Accelerometer) &&
+                idle.Hid.GyroscopeDegreesPerSecond == std::array<float, 3>{},
+                "stick release reverted to unrelated physical gravity");
+    }
+    input.MouseDeltaY = 7;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    input.MouseDeltaY = 0;
+    const auto mouseGravity = state.Composition.LastGravity;
+    for (int i = 0; i < 300; ++i) {
+        input.ControllerMotion.GyroscopeDegreesPerSecond = {3, -8, 2};
+        input.ControllerMotion.Accelerometer = {0.4F, -0.8F, 0.3F};
+        const auto idle = ResolveInput(config, input, {}, {}, nullptr, true, &state);
+        Require(state.AutomaticOwner == VirtualMotionState::Owner::Mouse &&
+                NearVector(idle.Hid.Accelerometer, mouseGravity) &&
+                idle.Hid.GyroscopeDegreesPerSecond == std::array<float, 3>{},
+                "idle mouse lost ownership to sensors");
+    }
+    input.ControllerMotion.Accelerometer = {0.6F, -0.8F, 0};
+    input.ControllerMotion.GyroscopeDegreesPerSecond = {};
+    input.ControllerButtons = 1;
+    const auto handoff = ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(state.AutomaticOwner == VirtualMotionState::Owner::Controller &&
+            NearVector(handoff.Hid.Accelerometer, mouseGravity), "device handoff snapped gravity");
+    input.MouseDeltaX = 4;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    input.MouseDeltaX = 0;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(state.AutomaticOwner == VirtualMotionState::Owner::Mouse, "held button repeatedly reclaimed aim");
+    input.ControllerButtons = 0;
+    input.RightStickX = 100;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(state.AutomaticOwner == VirtualMotionState::Owner::Mouse, "stick deadzone noise reclaimed aim");
+    input.ControllerPressed = 1;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(state.AutomaticOwner == VirtualMotionState::Owner::Controller,
+            "buffered short controller tap did not reclaim aim");
+    input.ControllerPressed = 0;
+    input.MouseDeltaX = 2;
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    input.MouseDeltaX = 0;
+    input.RightStickX = 20000;
+    const auto before = state.Composition;
+    ResolveInput(config, input, {}, {}, nullptr, false, &state);
+    Require(state.Composition.SensorToVirtual == before.SensorToVirtual &&
+            state.AutomaticOwner == VirtualMotionState::Owner::Mouse,
+            "presentation-only frame advanced motion state");
+    ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(state.AutomaticOwner == VirtualMotionState::Owner::Controller, "stick did not reclaim aim");
+    input.RightStickX = 0;
+    const auto beforeDetach = state.Composition.LastGravity;
+    state.ResetController();
+    input.ControllerMotion = {};
+    const auto detached = ResolveInput(config, input, {}, {}, nullptr, true, &state);
+    Require(NearVector(detached.Hid.Accelerometer, beforeDetach), "disconnect snapped aim");
+
+    for (const int hz : {30, 60, 90, 120}) {
+        MotionCompositionState composition;
+        ComposedMotion sample;
+        for (int i = 0; i < hz; ++i)
+            sample = composition.Sample({0,-1,0}, true, {}, 60, 0, 1.0/hz, true, true);
+        Require(NearVector(sample.Gravity, {0,-0.5F,0.8660254F}), "composition changed speed with cadence");
+        const auto rotated = composition.Sample({0,-1,0}, true, {0,60,0}, 0,0,1.0/hz,true,true);
+        Require(NearVector(rotated.AngularVelocity, {0,30,-51.961524F}, 1e-4F),
+                "physical gyro not transformed with gravity after virtual pitch");
+        VirtualMotionState paced;
+        PhysicalInputState pad;
+        pad.RightStickY = -32767;
+        pad.ControllerMotion.AccelerometerValid = pad.ControllerMotion.GyroscopeValid = true;
+        double pending = 0;
+        for (int i = 0; i < hz; ++i) {
+            const bool consume = (i + 1) % (hz / 30) == 0;
+            pad.SamplePeriodSeconds = ConsumeInputPeriod(1.0 / hz, consume, pending);
+            ResolveInput(config, pad, {}, {}, nullptr, consume, &paced);
+        }
+        Require(NearVector(paced.Composition.LastGravity, {0,1,0}) && pending == 0,
+                "controller integration depends on interpolated presentation frequency");
+        MotionCompositionState diagonal;
+        for (int i = 0; i < hz; ++i)
+            sample = diagonal.Sample({0,-1,0}, true, {}, 60, 100, 1.0/hz, true, true);
+        Require(NearVector(sample.Gravity, {0,-0.5F,0.8660254F}),
+                "simultaneous yaw corrupted pitch gravity or introduced cadence dependence");
+    }
+    MotionCompositionState rolled;
+    for (int i = 0; i < 120; ++i)
+        Require(NearVector(rolled.Sample({0.6F,-0.8F,0}, true, {}, 0,120,1.0/60,true,true).Gravity,
+                           {0.6F,-0.8F,0}), "world yaw tilts a rolled controller");
+    MotionCompositionState upsideDown;
+    upsideDown.RestoreGravity({0,1,0});
+    Require(NearVector(upsideDown.Sample({0,-1,0}, true, {}, 0,0,1.0/60,true,true).Gravity, {0,1,0}),
+            "opposite gravity handoff is singular");
+}
+
 } // namespace
 
 int main() try {
+    TestAutomaticMotionComposition();
+    {
+        using namespace ThreeDsRecomp::Input;
+        const auto motion = ConvertSdlMotion({9.80665F, 9.80665F, -9.80665F}, true,
+                                             {1, 2, 3}, true);
+        Require(motion.Accelerometer == std::array<float, 3>{1, -1, -1} &&
+                std::abs(motion.GyroscopeDegreesPerSecond[0] + 57.29578F) < 0.001F &&
+                std::abs(motion.GyroscopeDegreesPerSecond[1] - 114.59156F) < 0.001F &&
+                std::abs(motion.GyroscopeDegreesPerSecond[2] + 171.88734F) < 0.001F,
+                "SDL sensors must match Azahar native 3DS coordinates/units");
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const auto invalid = ConvertSdlMotion({nan, 0, 0}, true, {0, 0, 0}, false);
+        Require(!invalid.AccelerometerValid && !invalid.GyroscopeValid, "invalid sensor accepted");
+        MappingConfig gyroConfig;
+        gyroConfig.CStickSource = MotionSource::ControllerGyroscope;
+        gyroConfig.NativeMotionSource = MotionSource::ControllerMotion;
+        PhysicalInputState gyroInput;
+        gyroInput.ControllerMotion.GyroscopeValid = true;
+        gyroInput.ControllerMotion.GyroscopeDegreesPerSecond = {0, -30, 0};
+        const auto yaw = ResolveInput(gyroConfig, gyroInput, {});
+        Require(yaw.CStick.X == 0 && yaw.CStick.Y == 0, "motion leaked into camera");
+        gyroConfig.NativeMotionInvertX = true;
+        Require(ResolveInput(gyroConfig, gyroInput, {}).Hid.GyroscopeDegreesPerSecond[1] == 30,
+                "native motion horizontal inversion omitted yaw");
+        gyroInput.ControllerMotion.GyroscopeDegreesPerSecond = {0, 0, 30};
+        Require(ResolveInput(gyroConfig, gyroInput, {}).CStick.X == 0, "roll steers camera yaw");
+        gyroInput.ControllerMotion.AccelerometerValid = true;
+        gyroInput.ControllerMotion.Accelerometer = {0.5F, -0.8F, 0.4F};
+        for (const auto source : {MotionSource::Automatic, MotionSource::ControllerGyroscope,
+                MotionSource::ControllerAccelerometer, MotionSource::ControllerMotion}) {
+            gyroConfig.CStickSource = source;
+            const auto still = ResolveInput(gyroConfig, gyroInput, {});
+            Require(still.CStick.X == 0 && still.CStick.Y == 0 && still.Hid.GyroscopeValid &&
+                    still.Hid.AccelerometerValid, "camera isolation disabled aim or leaked sensors");
+            gyroInput.RightStickX = 16000;
+            Require(ResolveInput(gyroConfig, gyroInput, {}).CStick.X > 0,
+                    "legacy motion camera did not fall back to stick");
+            gyroInput.RightStickX = 0;
+        }
+        const auto edge = MapNormalizedTouch({1, 1, true});
+        const auto center = MapNormalizedTouch({0.5F, 0.5F, true});
+        Require(edge.X == 319 && edge.Y == 239 && edge.Pressed &&
+                center.X == 160 && center.Y == 120 &&
+                !MapNormalizedTouch({nan, 0, true}).Pressed &&
+                !MapNormalizedTouch({-0.1F, 0, true}).Pressed &&
+                !MapNormalizedTouch({0.5F, 0.5F, false}).Pressed,
+                "normalized touch bounds/release");
+        MotionCalibrationAccumulator calibration;
+        MotionObservation sample;
+        sample.GyroscopeValid = sample.AccelerometerValid = true;
+        sample.GyroscopeDegreesPerSecond = {1, -2, 3};
+        sample.Accelerometer = {0, -1, 0};
+        sample.GyroscopeTimestampMicroseconds = sample.AccelerometerTimestampMicroseconds = 1;
+        for (int i = 0; i < 120; ++i) Require(!calibration.Observe(sample), "duplicate sensor completed calibration");
+        Require(calibration.SamplesCollected() == 1, "duplicate sensor counted repeatedly");
+        sample.GyroscopeDegreesPerSecond = {100, 0, 0};
+        Require(!calibration.Observe(sample) && calibration.WaitingForStillness() &&
+                calibration.SamplesCollected() == 0, "moving controller accepted for calibration");
+        sample.GyroscopeDegreesPerSecond = {1, -2, 3};
+        for (unsigned i = 1; i <= MotionCalibrationAccumulator::SamplesRequired; ++i) {
+            sample.GyroscopeTimestampMicroseconds = sample.AccelerometerTimestampMicroseconds = i + 1;
+            Require(calibration.Observe(sample) == (i == MotionCalibrationAccumulator::SamplesRequired),
+                    "fresh calibration completion mismatch");
+        }
+        Require(calibration.Mean().GyroscopeDegreesPerSecond == sample.GyroscopeDegreesPerSecond,
+                "calibration bias incorrect");
+        calibration.Reset();
+        sample.GyroscopeValid = false;
+        sample.AccelerometerTimestampMicroseconds = 0;
+        for (unsigned i = 1; i <= MotionCalibrationAccumulator::SamplesRequired; ++i)
+            Require(calibration.Observe(sample) == (i == MotionCalibrationAccumulator::SamplesRequired),
+                    "accelerometer-only timestamp-less calibration");
+    }
+    {
+        using namespace ThreeDsRecomp::Input;
+        const std::array<DeviceDescriptor, 3> devices{{
+            {7, "pad", "Same model", false, false, "AA:01"},
+            {3, "pad", "Same model", false, false, "AA:02"},
+            {1, "virtual", "Steam Input", false, false, ""},
+        }};
+        Require(SelectControllerDevice(devices, "", "") == 1,
+                "automatic selection must be independent of enumeration order");
+        Require(SelectControllerDevice(devices, "", "", 7) == 7,
+                "automatic selection switched an attached active device");
+        Require(SelectControllerDevice(devices, "pad", "") == 3 &&
+                SelectControllerDevice(devices, "pad", "", 7) == 7,
+                "legacy GUID preference is not deterministic and sticky");
+        Require(SelectControllerDevice(devices, "pad", "aa-01", 3) == 7,
+                "serial preference ignored or not normalized");
+        Require(SelectControllerDevice(devices, "pad", "missing", 7) == -1 &&
+                SelectControllerDevice(devices, "missing", "", 7) == -1,
+                "explicit missing preference silently routes another controller");
+        Require(SelectControllerDevice({}, "", "", 7) == -1 &&
+                SelectControllerDevice(devices, "", "", 99) == 1,
+                "disconnect did not clear selection or choose automatic replacement");
+        auto reconnected = devices;
+        reconnected[0].InstanceId = 50;
+        Require(SelectControllerDevice(reconnected, "pad", "aa01", 7) == 50,
+                "reconnect persisted an obsolete session ID");
+    }
     using namespace ThreeDsRecomp::Input;
     TestVirtualMotion();
 

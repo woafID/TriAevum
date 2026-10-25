@@ -1,7 +1,9 @@
 #include "fast/oot3d/grass_world_placement_cache.h"
 #include "fast/oot3d/grass_visibility.h"
+#include "fast/oot3d/grass_actor_cells.h"
 #include "fast/oot3d/grass_distant_tuft.h"
 #include "fast/oot3d/grass_indexed_topology.h"
+#include "fast/oot3d/grass_residency.h"
 #include "fast/oot3d/grass_selection_cache.h"
 #include "fast/oot3d/grass_selection_budget.h"
 #include "fast/oot3d/grass_surface_reference.h"
@@ -10,7 +12,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <vector>
 #include <cmath>
 
@@ -73,25 +77,9 @@ TEST(Oot3dGrassSurfaceLighting, DecodesMaterialScalesWithoutSceneExceptions) {
 
 TEST(Oot3dGrassSurfaceLighting, RejectsMissingNativeShaderHooks) {
     EXPECT_TRUE(Fast::Renderer3ds::BuildPicaSurfaceLightingVertexShader(
-        "void main() {}", {}).empty());
+        "void main() {}", {}, false).empty());
 }
 
-TEST(Oot3dGrassSurfaceLighting, PreservesNativeProgramBeforeAtlasProjection) {
-    using namespace Fast::Renderer3ds;
-    const std::string source = "// native registers\nvoid main() { native_lighting();\n}";
-    PicaVertexShaderHookLayout hooks;
-    hooks.SchemaVersion = kPicaShaderHookSchemaVersion;
-    hooks.SourceSize = source.size();
-    hooks.Offsets.fill(0);
-    hooks.Offsets[size_t(PicaVertexShaderHook::RegisterStateEnd)] = source.find("void main");
-    hooks.Offsets[size_t(PicaVertexShaderHook::MainBodyBegin)] = source.find("native_lighting");
-    hooks.Offsets[size_t(PicaVertexShaderHook::MainBodyEnd)] = source.rfind('}');
-    const auto patched = BuildPicaSurfaceLightingVertexShader(source, hooks);
-    ASSERT_FALSE(patched.empty());
-    EXPECT_LT(patched.find("native_lighting();"), patched.find("uint atlas_index"));
-    EXPECT_LT(patched.find("layout(push_constant)"), patched.find("void main()"));
-    EXPECT_EQ(source, "// native registers\nvoid main() { native_lighting();\n}");
-}
 
 TEST(Oot3dGrassSurfaceReference, SubdivisionRetainsOriginalTriangleCoordinates) {
     using namespace Fast::Oot3d;
@@ -190,31 +178,93 @@ TEST(Oot3dGrassSelectionCache, ReusesOnlyIdenticalSelectionInputs) {
     changes([](auto& v){v.Policy.TuftTransitionFraction+=0.01F;});
     changes([](auto& v){v.Policy.FarTuftDensity+=0.01F;});
     changes([](auto& v){v.Policy.SegmentLodSoftness+=0.01F;});
+    changes([](auto& v){v.Policy.CrossedBlades=!v.Policy.CrossedBlades;});
     cache.Reset();
     EXPECT_FALSE(cache.Matches(key));
 }
 
-TEST(Oot3dGrassSelectionBudget, ParallelBinsKeepExactlyTheSerialPrefixAtEveryBudget) {
+TEST(Oot3dGrassSelectionBudget, BucketQuantizesTheStableVisibilityOverRetention) {
     using namespace Fast::Oot3d;
-    constexpr size_t binCount = 25;
-    std::vector<uint32_t> all;
-    for(uint32_t i=0;i<400;++i) if(i%7!=0) all.push_back(10000+i*11);
-    for(uint32_t budget=0;budget<=all.size()+3;++budget) {
-        for(size_t workers : {1U,2U,3U,10U,12U}) {
-            std::array<std::vector<uint32_t>,binCount> merged;
-            uint32_t remaining=budget;
-            for(size_t worker=0;worker<workers;++worker) {
-                std::array<std::vector<uint32_t>,binCount> bins;
-                for(size_t i=all.size()*worker/workers;i<all.size()*(worker+1)/workers;++i)
-                    bins[(i*23)%binCount].push_back(all[i]);
-                remaining-=LimitGrassSelectionBins(bins,remaining);
-                for(size_t i=0;i<binCount;++i) merged[i].insert(merged[i].end(),bins[i].begin(),bins[i].end());
-            }
-            std::array<std::vector<uint32_t>,binCount> expected;
-            for(size_t i=0;i<std::min<size_t>(budget,all.size());++i) expected[(i*23)%binCount].push_back(all[i]);
-            EXPECT_EQ(merged,expected) << "budget " << budget << " workers " << workers;
+    EXPECT_EQ(GrassBudgetBucket(0.5F, 0.0F), 0U) << "no retention: every root in the first bucket";
+    EXPECT_EQ(GrassBudgetBucket(0.0F, 1.0F), 0U);
+    EXPECT_EQ(GrassBudgetBucket(0.5F, 1.0F), 512U);
+    EXPECT_EQ(GrassBudgetBucket(0.25F, 0.5F), 512U) << "the key is relative to the LOD retention";
+    EXPECT_EQ(GrassBudgetBucket(1.0F, 1.0F), kGrassBudgetBuckets - 1U) << "clamped to the last bucket";
+    EXPECT_EQ(GrassBudgetBucket(0.9F, 0.3F), kGrassBudgetBuckets - 1U);
+    EXPECT_EQ(GrassBudgetBucket(0.9999F, 1.0F), kGrassBudgetBuckets - 1U);
+    EXPECT_EQ(GrassBudgetBucket(1.0F / 1024.0F, 1.0F), 1U);
+    EXPECT_EQ(GrassBudgetBucket(-1.0F, 1.0F), 0U);
+}
+
+TEST(Oot3dGrassSelectionBudget, CutAdmitsTheLowestBucketsWithinTheBudget) {
+    using namespace Fast::Oot3d;
+    GrassBudgetHistogram histogram{};
+    EXPECT_EQ(GrassBudgetCut(histogram, 0), kGrassBudgetCutAll) << "nothing visible: nothing thinned";
+    histogram[0] = 10;
+    histogram[3] = 5;
+    histogram[7] = 1;
+    histogram[kGrassBudgetBuckets - 1U] = 4;
+    EXPECT_EQ(GrassBudgetCut(histogram, 20), kGrassBudgetCutAll);
+    EXPECT_EQ(GrassBudgetCut(histogram, 100), kGrassBudgetCutAll);
+    EXPECT_EQ(GrassBudgetCut(histogram, 19), kGrassBudgetBuckets - 1U) << "the last bucket does not fit";
+    EXPECT_EQ(GrassBudgetCut(histogram, 16), kGrassBudgetBuckets - 1U);
+    EXPECT_EQ(GrassBudgetCut(histogram, 15), 7U);
+    EXPECT_EQ(GrassBudgetCut(histogram, 14), 3U);
+    EXPECT_EQ(GrassBudgetCut(histogram, 10), 3U);
+    EXPECT_EQ(GrassBudgetCut(histogram, 9), 0U) << "the first bucket alone exceeds the budget";
+    EXPECT_EQ(GrassBudgetCut(histogram, 0), 0U);
+    EXPECT_TRUE(GrassBudgetAdmits(2U, 3U));
+    EXPECT_FALSE(GrassBudgetAdmits(3U, 3U));
+    EXPECT_FALSE(GrassBudgetAdmits(0U, 0U));
+    EXPECT_TRUE(GrassBudgetAdmits(kGrassBudgetBuckets - 1U, kGrassBudgetCutAll));
+    GrassBudgetHistogram overflow{};
+    overflow.fill(0xFFFFFFFFU);
+    EXPECT_EQ(GrassBudgetCut(overflow, 0xFFFFFFFFU), 1U) << "cumulative counts do not wrap";
+}
+
+// The property the thinning exists for: over budget, every cluster keeps the
+// same fraction of its roots and the admitted set is independent of the
+// cluster order, so turning the camera (which reorders and reselects
+// clusters) never empties one direction while another stays dense.
+TEST(Oot3dGrassSelectionBudget, ThinningKeepsEveryClusterAndIgnoresClusterOrder) {
+    using namespace Fast::Oot3d;
+    constexpr size_t clusters = 8, perCluster = 1000;
+    std::vector<std::vector<float>> keys(clusters);
+    uint32_t seed = 12345U;
+    for (auto& cluster : keys)
+        for (size_t i = 0; i < perCluster; ++i) {
+            seed = seed * 1664525U + 1013904223U;
+            cluster.push_back(float(seed >> 8U) / 16777216.0F);
         }
+    uint32_t largestBucket = 0;
+    const auto admitted = [&](const std::vector<size_t>& order, uint32_t budget) {
+        GrassBudgetHistogram histogram{};
+        for (const auto c : order)
+            for (const float key : keys[c]) ++histogram[GrassBudgetBucket(key, 1.0F)];
+        largestBucket = *std::max_element(histogram.begin(), histogram.end());
+        const auto cut = GrassBudgetCut(histogram, budget);
+        std::vector<std::vector<bool>> result(clusters);
+        for (const auto c : order)
+            for (const float key : keys[c]) result[c].push_back(GrassBudgetAdmits(GrassBudgetBucket(key, 1.0F), cut));
+        return result;
+    };
+    const std::vector<size_t> forward{0, 1, 2, 3, 4, 5, 6, 7}, backward{7, 6, 5, 4, 3, 2, 1, 0};
+    for (const uint32_t budget : {uint32_t(100), uint32_t(2000), uint32_t(4000), uint32_t(7999)}) {
+        const auto a = admitted(forward, budget), b = admitted(backward, budget);
+        EXPECT_EQ(a, b) << "budget " << budget;
+        size_t total = 0;
+        for (size_t c = 0; c < clusters; ++c) {
+            const auto kept = std::count(a[c].begin(), a[c].end(), true);
+            total += kept;
+            const double fraction = double(kept) / perCluster, expected = double(budget) / (clusters * perCluster);
+            EXPECT_NEAR(fraction, expected, 0.03) << "budget " << budget << " cluster " << c;
+        }
+        EXPECT_LE(total, budget);
+        // The budget is used up to one bucket.
+        EXPECT_GE(total + largestBucket, budget) << "budget " << budget;
     }
+    const auto full = admitted(forward, clusters * perCluster);
+    for (const auto& cluster : full) EXPECT_EQ(std::count(cluster.begin(), cluster.end(), false), 0);
 }
 
 TEST(Oot3dGrassSurfaceColor, WorldAnchorsRetainGridColorsWithoutChangingPlacement) {
@@ -648,4 +698,369 @@ TEST(Oot3dGrassVisibility, SpatialQueryMatchesExhaustiveCullingWithoutChangingAn
     }
     EXPECT_EQ(indexed.CullingAnchors.front().Position, anchors.front().LocalPosition);
     EXPECT_EQ(indexed.Anchors.back().StableId, anchors.back().StableId);
+}
+
+namespace {
+
+// Column-major clip matrix of a perspective camera at eye looking along yaw/pitch.
+std::array<float, 16> GrassTestViewProjection(const std::array<float, 3>& eye, float yaw, float pitch,
+                                              float fovY, float aspect) {
+    const std::array<float, 3> forward{std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+                                       -std::cos(pitch) * std::cos(yaw)};
+    std::array<float, 3> right{-forward[2], 0.0F, forward[0]};
+    const float rightLength = std::hypot(right[0], right[2]);
+    right[0] /= rightLength;
+    right[2] /= rightLength;
+    const std::array<float, 3> up{right[1] * forward[2] - right[2] * forward[1],
+                                  right[2] * forward[0] - right[0] * forward[2],
+                                  right[0] * forward[1] - right[1] * forward[0]};
+    const auto dot = [](const auto& a, const auto& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const float sy = 1.0F / std::tan(fovY * 0.5F), sx = sy / aspect, nearPlane = 1.0F, farPlane = 100000.0F;
+    const float a = (farPlane + nearPlane) / (nearPlane - farPlane), b = 2.0F * farPlane * nearPlane / (nearPlane - farPlane);
+    // View rows: right, up, -forward; clip w is the distance along forward.
+    std::array<float, 16> m{};
+    for (size_t column = 0; column < 3U; ++column) {
+        m[column * 4U + 0U] = sx * right[column];
+        m[column * 4U + 1U] = sy * up[column];
+        m[column * 4U + 2U] = -a * forward[column];
+        m[column * 4U + 3U] = forward[column];
+    }
+    m[12] = -sx * dot(right, eye);
+    m[13] = -sy * dot(up, eye);
+    m[14] = a * dot(forward, eye) + b;
+    m[15] = -dot(forward, eye);
+    return m;
+}
+
+} // namespace
+
+TEST(Oot3dGrassVisibility, RetentionBoundDoesNotIncreaseWithDistance) {
+    using namespace Fast::Oot3d;
+    InteractiveGrassSettings settings;
+    settings.DrawDistance = 50000;
+    settings.LodReferenceDistance = 2282;
+    settings.FarTuftsEnabled = true;
+    for (float density : {0.5F, 1.0F, 2.0F, 4.0F}) {
+        settings.FarTuftDensity = density;
+        for (float far : {0.05F, 0.6F, 1.0F}) {
+            settings.FarDensity = far;
+            const auto policy = BuildGrassLodPolicy(settings);
+            float previous = GrassLodRetentionUpperBound(policy, 0.0F);
+            for (float distance = 0.25F; distance <= 12000.0F; distance += 0.25F) {
+                const float bound = GrassLodRetentionUpperBound(policy, distance);
+                ASSERT_LE(bound, previous + 1.0e-6F) << "density " << density << " far " << far << " at " << distance;
+                previous = bound;
+            }
+        }
+    }
+}
+
+TEST(Oot3dGrassVisibility, CandidateEnvelopeRefinesToTheExactClusterWork) {
+    using namespace Fast::Oot3d;
+    std::vector<GrassAnchor> anchors;
+    std::vector<GrassAnchorCluster> clusters;
+    uint32_t stable = 1U;
+    for (uint32_t i = 0; i < 96U * 96U; ++i) {
+        const std::array<float, 3> center{(static_cast<float>(i % 96U) - 48.0F) * 60.0F,
+            std::sin(static_cast<float>(i) * 0.37F) * 40.0F, -(static_cast<float>(i / 96U) - 8.0F) * 60.0F};
+        const uint32_t first = static_cast<uint32_t>(anchors.size());
+        std::vector<GrassAnchor> local;
+        for (uint32_t j = 0; j < 6U; ++j) {
+            local.push_back({.LocalPosition = {center[0] + (static_cast<float>(j % 3U) - 1.0F) * 15.0F, center[1],
+                                               center[2] + (static_cast<float>(j / 3U) - 0.5F) * 20.0F},
+                             .BladeHeight = 8.0F, .StableId = stable++});
+        }
+        // Culling anchors are ordered by stable visibility inside a cluster.
+        std::sort(local.begin(), local.end(), [](const auto& x, const auto& y) {
+            return GrassStableVisibilityValue(x.StableId) < GrassStableVisibilityValue(y.StableId);
+        });
+        anchors.insert(anchors.end(), local.begin(), local.end());
+        clusters.push_back({.FirstAnchor = first, .AnchorCount = 6U, .LocalCenter = center, .LocalRadius = 25.0F,
+                            .MaximumBladeHeight = 8.0F});
+    }
+    auto request = BaseRequest(anchors, clusters);
+    request.TransformBakedIntoVertices = true;
+    request.NormalOffset = 0.0F;
+    const auto placement = BuildGrassWorldPlacement(request);
+    ASSERT_GT(placement.VisibilityNodes.size(), 1U);
+    // The canonical decision is per cluster: a flat scan without hierarchy.
+    auto flat = placement;
+    flat.VisibilityNodes.clear();
+    for (uint32_t c = 0; c < placement.Clusters.size(); ++c) {
+        const auto& cluster = placement.Clusters[c];
+        for (uint32_t a = cluster.FirstAnchor + 1U; a < cluster.FirstAnchor + cluster.AnchorCount; ++a)
+            ASSERT_LE(placement.CullingAnchors[a - 1U].StableVisibility, placement.CullingAnchors[a].StableVisibility);
+    }
+
+    InteractiveGrassSettings settings;
+    settings.DrawDistance = 5000;
+    settings.LodReferenceDistance = 700;
+    settings.LodStartFraction = 0.1F;
+    settings.LodEndFraction = 0.3F;
+    settings.TuftTransitionFraction = 0.6F;
+    settings.FarDensity = 0.7F;
+    settings.FarTuftsEnabled = true;
+    uint32_t seed = 12345U;
+    const auto random = [&seed](float low, float high) {
+        seed = seed * 1664525U + 1013904223U;
+        return low + (high - low) * static_cast<float>(seed >> 8U) / static_cast<float>(1U << 24U);
+    };
+    size_t contained = 0, refined = 0;
+    for (float density : {1.0F, 4.0F}) {
+        settings.FarTuftDensity = density;
+        const auto policy = BuildGrassLodPolicy(settings);
+        for (int base = 0; base < 6; ++base) {
+            const std::array<float, 3> eye0{random(-1500, 1500), random(60, 200), random(-1500, 500)};
+            const float yaw0 = random(-3.1F, 3.1F), pitch0 = random(-0.4F, 0.05F), fov0 = random(0.8F, 1.1F);
+            const auto clip0 = GrassTestViewProjection(eye0, yaw0, pitch0, fov0, 16.0F / 9.0F);
+            for (bool frustum : {true, false}) {
+                const auto envelope = MakeGrassCandidateEnvelope(clip0, eye0, 16.0F, 0.02F, 2.0F);
+                ASSERT_TRUE(GrassCandidateEnvelopeContains(envelope, clip0, eye0));
+                std::vector<GrassClusterCandidate> candidates, part;
+                (void)SelectGrassClusterCandidates(placement, envelope, policy, 3.0F, frustum, 0U, candidates);
+                // A split traversal covers the same candidates.
+                std::vector<uint32_t> roots;
+                (void)SplitGrassClusterCandidates(placement, envelope, policy, 3.0F, frustum, 8U, roots);
+                std::vector<GrassClusterCandidate> merged;
+                for (const auto root : roots) {
+                    (void)SelectGrassClusterCandidates(placement, envelope, policy, 3.0F, frustum, root, part);
+                    merged.insert(merged.end(), part.begin(), part.end());
+                }
+                const auto byIndex = [](const auto& x, const auto& y) { return x.ClusterIndex < y.ClusterIndex; };
+                std::sort(candidates.begin(), candidates.end(), byIndex);
+                std::sort(merged.begin(), merged.end(), byIndex);
+                EXPECT_EQ(merged, candidates);
+                for (int sample = 0; sample < 40; ++sample) {
+                    // Half of the samples stay well inside, the rest probe the edge.
+                    const float scale = sample < 20 ? 0.5F : 1.0F;
+                    const std::array<float, 3> eye{eye0[0] + random(-9, 9) * scale, eye0[1] + random(-9, 9) * scale,
+                                                   eye0[2] + random(-9, 9) * scale};
+                    const auto clip = GrassTestViewProjection(eye, yaw0 + random(-0.012F, 0.012F) * scale,
+                        pitch0 + random(-0.01F, 0.01F) * scale, fov0 + random(-0.01F, 0.01F) * scale, 16.0F / 9.0F);
+                    if (!GrassCandidateEnvelopeContains(envelope, clip, eye)) continue;
+                    ++contained;
+                    std::vector<GrassClusterWork> exact, cached;
+                    const auto exactStats = SelectGrassClusterWork(placement, clip, eye, policy, 3.0F, frustum, exact);
+                    std::vector<GrassClusterWork> canonical;
+                    (void)SelectGrassClusterWork(flat, clip, eye, policy, 3.0F, frustum, canonical);
+                    EXPECT_EQ(exact, canonical) << "hierarchy differs from the flat scan";
+                    uint64_t anchorsFromCandidates = 0;
+                    if (!RefineGrassClusterCandidates(placement, candidates, clip, eye, policy, 3.0F, frustum, cached,
+                                                      anchorsFromCandidates))
+                        continue;
+                    ++refined;
+                    EXPECT_EQ(cached, exact) << "density " << density << " base " << base << " sample " << sample;
+                    EXPECT_EQ(anchorsFromCandidates, exactStats.CandidateAnchors);
+                }
+            }
+        }
+    }
+    // Refinement inside the envelope never reports a violation.
+    EXPECT_EQ(refined, contained);
+    EXPECT_GT(contained, 200U);
+    // Views far outside are not contained.
+    const std::array<float, 3> eye{0, 100, 0};
+    const auto clip = GrassTestViewProjection(eye, 0, 0, 1, 1.5F);
+    const auto envelope = MakeGrassCandidateEnvelope(clip, eye, 16.0F, 0.02F, 2.0F);
+    EXPECT_FALSE(GrassCandidateEnvelopeContains(envelope, GrassTestViewProjection(eye, 0.2F, 0, 1, 1.5F), eye));
+    EXPECT_FALSE(GrassCandidateEnvelopeContains(envelope, clip, {0, 100, 40}));
+}
+
+TEST(Oot3dGrassActorCells, EveryActorThatCanTouchARootIsListedInItsCellInOrder) {
+    using namespace Fast::Oot3d;
+    uint32_t seed = 777U;
+    const auto random = [&seed](float low, float high) {
+        seed = seed * 1664525U + 1013904223U;
+        return low + (high - low) * static_cast<float>(seed >> 8U) / static_cast<float>(1U << 24U);
+    };
+    for (int scene = 0; scene < 20; ++scene) {
+        std::vector<GrassInteractor> actors(static_cast<size_t>(1 + scene * 5));
+        const float spread = scene % 2 == 0 ? 8000.0F : 60.0F;
+        for (auto& actor : actors) {
+            actor.Position = {random(-spread, spread), random(-50, 50), random(-spread, spread)};
+            actor.PreviousPosition = {actor.Position[0] + random(-30, 30), actor.Position[1],
+                                      actor.Position[2] + random(-30, 30)};
+            actor.Radius = random(0.0F, 40.0F);
+        }
+        const float multiplier = 1.25F;
+        const auto cells = BuildGrassActorCells(actors, multiplier);
+        ASSERT_GT(cells.Width, 0U);
+        ASSERT_LE(cells.Width, kGrassActorCellsMaximumExtent);
+        ASSERT_LE(cells.Height, kGrassActorCellsMaximumExtent);
+        const uint32_t cellCount = cells.Width * cells.Height;
+        ASSERT_GE(cells.Words.size(), cellCount + 1U);
+        for (int sample = 0; sample < 4000; ++sample) {
+            // Roots near actors, and anywhere in the scene.
+            const auto& near = actors[static_cast<size_t>(sample) % actors.size()];
+            const std::array<float, 2> root = sample % 3 == 0
+                ? std::array<float, 2>{random(-spread * 1.2F, spread * 1.2F), random(-spread * 1.2F, spread * 1.2F)}
+                : std::array<float, 2>{near.Position[0] + random(-60, 60), near.Position[2] + random(-60, 60)};
+            std::vector<uint32_t> touching;
+            for (uint32_t i = 0; i < actors.size(); ++i) {
+                const auto box = GrassActorSweptBox(actors[i], multiplier);
+                if (!(root[0] < box[0] || root[1] < box[1] || root[0] > box[2] || root[1] > box[3]))
+                    touching.push_back(i);
+            }
+            // The shader's cell lookup.
+            const float cx = std::floor((root[0] - cells.Origin[0]) * cells.InverseCellSize);
+            const float cz = std::floor((root[1] - cells.Origin[1]) * cells.InverseCellSize);
+            std::vector<uint32_t> listed;
+            if (cx >= 0 && cz >= 0 && cx < static_cast<float>(cells.Width) && cz < static_cast<float>(cells.Height)) {
+                const uint32_t index = static_cast<uint32_t>(cz) * cells.Width + static_cast<uint32_t>(cx);
+                for (uint32_t i = cells.Words[index]; i < cells.Words[index + 1U]; ++i)
+                    listed.push_back(cells.Words[cellCount + 1U + i]);
+            }
+            ASSERT_TRUE(std::is_sorted(listed.begin(), listed.end()));
+            ASSERT_TRUE(std::includes(listed.begin(), listed.end(), touching.begin(), touching.end()))
+                << "scene " << scene << " sample " << sample;
+        }
+    }
+    // Non-finite actors disable the grid: the shader iterates every actor.
+    std::vector<GrassInteractor> invalid(2);
+    invalid[1].Position[0] = NAN;
+    EXPECT_EQ(BuildGrassActorCells(invalid, 1.0F).Width, 0U);
+    EXPECT_EQ(BuildGrassActorCells({}, 1.0F).Width, 0U);
+}
+
+TEST(Oot3dGrassVisibility, LodEvaluatorFarBandIsBitIdentical) {
+    using namespace Fast::Oot3d;
+    InteractiveGrassSettings base;
+    base.DrawDistance = 50000;
+    base.LodReferenceDistance = 2282;
+    base.LodStartFraction = 0.32F;
+    base.LodEndFraction = 0.32F;
+    base.TuftTransitionFraction = 0.48F;
+    base.FarTuftsEnabled = true;
+    base.FarTuftBladeCount = 4;
+    base.FarTuftDensity = 2;
+    base.FarDensity = 1;
+    base.Appearance.BladeSegments = 5;
+    base.FarBladeSegments = 1;
+    base.SegmentLodStartDistance = 501;
+    base.SegmentLodEndDistance = 1000;
+    base.SegmentLodSoftness = 0.75F;
+    std::vector<InteractiveGrassSettings> variants(8, base);
+    variants[1].TuftTransitionFraction = 0;
+    variants[2].FarTuftsEnabled = false;
+    variants[3].SegmentLodSoftness = 0;
+    variants[4].SegmentLodSoftness = 1;
+    variants[5].SegmentLodEndDistance = 400;  // end below start
+    variants[6].LodReferenceDistance = 0;
+    variants[6].DrawDistance = 3000;
+    variants[7].FarDensity = 0.3F;
+    variants[7].FarTuftDensity = 0.5F;
+    size_t far = 0;
+    for (const auto& settings : variants) {
+        const auto policy = BuildGrassLodPolicy(settings);
+        const GrassLodEvaluator evaluator(policy);
+        for (float distance = -10.0F; distance <= 9000.0F; distance += 0.37F) {
+            for (uint32_t id = 1; id < 400; id += 7) {
+                const float stable = GrassStableVisibilityValue(id * 2654435761U);
+                const auto expected = ResolveGrassLodWithStableVisibility(policy, distance, stable);
+                const auto actual = evaluator.Resolve(distance, stable);
+                ASSERT_EQ(actual.Visible, expected.Visible) << distance;
+                ASSERT_EQ(actual.BladeSegments, expected.BladeSegments) << distance;
+                ASSERT_EQ(actual.PlaneCount, expected.PlaneCount) << distance;
+                ASSERT_EQ(actual.DistantTuft, expected.DistantTuft) << distance;
+                ASSERT_EQ(std::bit_cast<uint32_t>(actual.Retention), std::bit_cast<uint32_t>(expected.Retention)) << distance;
+            }
+            far += distance >= 1826.0F;
+        }
+    }
+    EXPECT_GT(far, 0U);
+}
+
+TEST(Oot3dGrassResidency, StoresEveryPrefixACameraWithinTheMarginSelects) {
+    using namespace Fast::Oot3d;
+    InteractiveGrassSettings settings;
+    settings.DrawDistance = 50000;
+    settings.LodReferenceDistance = 2282;
+    settings.FarTuftsEnabled = true;
+    settings.FarDensity = 1.0F;
+    const auto policy = BuildGrassLodPolicy(settings);
+    const float bladeRadiusScale = 1.6F;
+    // A 12 km strip of clusters, 64 anchors each in stable-visibility order.
+    auto world = std::make_shared<GrassWorldPlacement>();
+    for (uint32_t c = 0; c < 400U; ++c) {
+        GrassWorldCluster cluster;
+        cluster.FirstAnchor = static_cast<uint32_t>(world->Anchors.size());
+        cluster.AnchorCount = 64U;
+        cluster.Center = {static_cast<float>(c) * 30.0F, 0.0F, static_cast<float>(c % 7U) * 11.0F};
+        cluster.Radius = 20.0F;
+        cluster.MaximumBladeHeight = 10.0F;
+        for (uint32_t a = 0; a < 64U; ++a) {
+            GrassWorldAnchor anchor;
+            anchor.StableId = c * 64U + a;
+            world->Anchors.push_back(anchor);
+            world->CullingAnchors.push_back({cluster.Center, (static_cast<float>(a) + 0.5F) / 64.0F});
+            world->ShadowReferences.push_back({c, a, 0.5F});
+        }
+        cluster.MinimumStableVisibility = world->CullingAnchors[cluster.FirstAnchor].StableVisibility;
+        world->Clusters.push_back(cluster);
+    }
+    const std::array<float, 3> eye{3000.0F, 5.0F, 40.0F};
+    const float margin = 1000.0F;
+    const auto residency = BuildGrassResidency({world}, 9U, eye, policy, bladeRadiusScale, margin, true);
+    ASSERT_EQ(residency.Clusters.size(), 1U);
+    // Full density reaches 2282 + the margin; farther clusters keep short prefixes.
+    EXPECT_LT(residency.Anchors.size(), world->Anchors.size() * 3U / 5U);
+    EXPECT_EQ(residency.ShadowReferences.size(), residency.Anchors.size());
+
+    // Any camera within the margin: each cluster's selected prefix is stored,
+    // and the store keeps only the clusters that have one, in order.
+    const auto expectCoverage = [&](const GrassResidency& stored, const GrassLodPolicy& lod) {
+        std::vector<const GrassWorldCluster*> storedFor(world->Clusters.size(), nullptr);
+        uint32_t previous = 0;
+        for (const auto& cluster : stored.Clusters[0]) {
+            ASSERT_GT(cluster.AnchorCount, 0U);
+            const uint32_t c = stored.Anchors[cluster.FirstAnchor].StableId / 64U;
+            ASSERT_TRUE(storedFor[c] == nullptr && c >= previous);
+            storedFor[c] = &cluster;
+            previous = c;
+        }
+        for (float dx : {-1000.0F, -400.0F, 0.0F, 650.0F, 1000.0F}) {
+            const std::array<float, 3> camera{eye[0] + dx, eye[1], eye[2]};
+            for (size_t c = 0; c < world->Clusters.size(); ++c) {
+                const auto& original = world->Clusters[c];
+                float squared = 0.0F;
+                for (size_t axis = 0; axis < 3U; ++axis)
+                    squared += (original.Center[axis] - camera[axis]) * (original.Center[axis] - camera[axis]);
+                const float radius = original.Radius + original.MaximumBladeHeight * (bladeRadiusScale - 1.0F);
+                const float nearest = std::max(0.0F, std::sqrt(squared) - radius);
+                const float retention = nearest <= lod.DrawDistance ? GrassLodRetentionUpperBound(lod, nearest) : 0.0F;
+                const auto begin = world->CullingAnchors.begin() + original.FirstAnchor;
+                const auto selected = std::upper_bound(begin, begin + original.AnchorCount, retention,
+                    [](float value, const GrassWorldCullingAnchor& anchor) { return value < anchor.StableVisibility; }) -
+                    begin;
+                const uint32_t count = storedFor[c] != nullptr ? storedFor[c]->AnchorCount : 0U;
+                ASSERT_LE(selected, static_cast<ptrdiff_t>(count)) << "cluster " << c << " camera " << dx;
+                // The store holds the same anchors, in the same order.
+                for (uint32_t a = 0; a < count; ++a) {
+                    ASSERT_EQ(stored.Anchors[storedFor[c]->FirstAnchor + a].StableId, original.FirstAnchor + a);
+                    ASSERT_EQ(stored.ShadowReferences[storedFor[c]->FirstAnchor + a].Second, a);
+                }
+            }
+        }
+    };
+    expectCoverage(residency, policy);
+    // A short draw distance leaves most clusters without resident anchors.
+    settings.DrawDistance = 1000;
+    const auto nearPolicy = BuildGrassLodPolicy(settings);
+    const auto nearResidency = BuildGrassResidency({world}, 9U, eye, nearPolicy, bladeRadiusScale, margin, true);
+    EXPECT_LT(nearResidency.Clusters[0].size(), world->Clusters.size() / 2U);
+    EXPECT_GT(nearResidency.Clusters[0].size(), 0U);
+    expectCoverage(nearResidency, nearPolicy);
+    // A second source's references address its points after the first's.
+    world->ShadowPoints.resize(400U);
+    const auto pair = BuildGrassResidency({world, world}, 10U, eye, policy, bladeRadiusScale, margin, true);
+    ASSERT_EQ(pair.SourceBase.size(), 2U);
+    ASSERT_EQ(pair.SourceBase[1], residency.Anchors.size());
+    for (size_t a = 0; a < residency.Anchors.size(); ++a) {
+        ASSERT_EQ(pair.ShadowReferences[a].First, residency.ShadowReferences[a].First);
+        ASSERT_EQ(pair.ShadowReferences[pair.SourceBase[1] + a].First, residency.ShadowReferences[a].First + 400U);
+        ASSERT_EQ(pair.ShadowReferences[pair.SourceBase[1] + a].Second, residency.ShadowReferences[a].Second + 400U);
+    }
+    EXPECT_TRUE(GrassResidencyCovers(residency, {eye[0] + 499.0F, eye[1], eye[2]}));
+    EXPECT_FALSE(GrassResidencyCovers(residency, {eye[0] + 501.0F, eye[1], eye[2]}));
+    EXPECT_NE(GrassResidencyPolicyKey(policy, bladeRadiusScale), GrassResidencyPolicyKey(policy, 1.0F));
 }

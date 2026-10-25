@@ -492,6 +492,21 @@ bool Oot3dNativePicaFrontend::SubmitGspCommand(
             SetError(error, "non-submit GSP command has command-list data");
             return false;
         }
+        if (commandId == static_cast<uint32_t>(Oot3dGspCommandId::TextureCopy) &&
+            (command.Parameters[2] & ~15U) == 0U) {
+            SetError(error, "GSP texture copy has zero aligned length");
+            return false;
+        }
+        if (commandId == static_cast<uint32_t>(Oot3dGspCommandId::TextureCopy) &&
+            mPacketSink != nullptr &&
+            !mPacketSink->SubmitDisplayTransfer(
+                {command.Parameters[0], command.Parameters[1],
+                 command.Parameters[3], command.Parameters[4],
+                 command.Parameters[5], command.Parameters[2]},
+                displayTransferDeferredToGpu, error,
+                displayTransferCpuCopySuppressed)) {
+            return false;
+        }
         if (commandId ==
                 static_cast<uint32_t>(Oot3dGspCommandId::DisplayTransfer) &&
             mPacketSink != nullptr &&
@@ -544,16 +559,10 @@ bool Oot3dNativePicaFrontend::SubmitGspCommand(
     mNextCommandListCompositionSpans.clear();
 
     const auto resolveComposition =
-        [&](uint32_t offsetWords) -> Oot3dPicaCompositionAttribution {
+        [&](uint32_t offsetWords) -> const Oot3dPicaCommandListCompositionSpan* {
         if (mCommandListCompositionDomain ==
             Oot3dPicaCompositionDomain::Ui) {
-            return {Oot3dPicaCompositionLayer::Ui,
-                    Oot3dPicaCompositionProvenance::NativeUiLifecycle,
-                    0U, 0U};
-        }
-        if (mCommandListCompositionDomain !=
-            Oot3dPicaCompositionDomain::Scene) {
-            return {};
+            return nullptr;
         }
         const uint64_t address = static_cast<uint64_t>(commandListAddress) +
                                  static_cast<uint64_t>(offsetWords) * 4U;
@@ -564,12 +573,10 @@ bool Oot3dNativePicaFrontend::SubmitGspCommand(
                 return value < span.BeginAddress;
             });
         if (found == compositionSpans.begin()) {
-            return {};
+            return nullptr;
         }
         const auto& candidate = *std::prev(found);
-        return address < candidate.EndAddress
-                   ? candidate.Attribution
-                   : Oot3dPicaCompositionAttribution{};
+        return address < candidate.EndAddress ? &candidate : nullptr;
     };
 
     size_t cursor = 0;
@@ -622,13 +629,44 @@ bool Oot3dNativePicaFrontend::SubmitGspCommand(
                         ComputeOot3dPicaLightingLutContentHash(*mLightingLuts);
                     mLightingLuts->ContentHashAvailable = true;
                 }
+                const auto* metadata = resolveComposition(offsetWords);
+                auto composition = metadata != nullptr
+                    ? metadata->Attribution
+                    : mCommandListCompositionDomain == Oot3dPicaCompositionDomain::Ui
+                        ? Oot3dPicaCompositionAttribution{
+                              Oot3dPicaCompositionLayer::Ui,
+                              Oot3dPicaCompositionProvenance::NativeUiLifecycle, 0U, 0U}
+                        : Oot3dPicaCompositionAttribution{};
+                if (composition.TemporalIdentity.Available()) {
+                    const uint64_t address = uint64_t{commandListAddress} + uint64_t{offsetWords} * 4U;
+                    if (metadata == nullptr || composition.TemporalPacketBeginAddress == 0 ||
+                        address < composition.TemporalPacketBeginAddress || address >= metadata->EndAddress)
+                        composition.TemporalIdentity = {};
+                    else
+                        composition.TemporalIdentity.Slot += address - composition.TemporalPacketBeginAddress;
+                }
+                composition.TemporalPacketBeginAddress = 0;
+                auto domain = mCommandListCompositionDomain;
+                switch (composition.Layer) {
+                    case Oot3dPicaCompositionLayer::OpaqueWorld:
+                    case Oot3dPicaCompositionLayer::TransparentWorld:
+                    case Oot3dPicaCompositionLayer::Atmosphere:
+                        domain = Oot3dPicaCompositionDomain::Scene;
+                        break;
+                    case Oot3dPicaCompositionLayer::Ui:
+                        domain = Oot3dPicaCompositionDomain::Ui;
+                        break;
+                    case Oot3dPicaCompositionLayer::Unknown:
+                        break;
+                }
                 Oot3dPicaDrawPacket draw(
                     commandListAddress, offsetWords,
-                    mCommandListCompositionDomain,
-                    resolveComposition(offsetWords),
+                    domain, composition,
                     id == kPicaTriggerDrawIndexed, mPicaRegisters,
                     mVertexShader, mGeometryShader, mFogLut, mProcTexLuts,
                     mLightingLuts, mDefaultAttributes);
+                if (metadata != nullptr && domain == Oot3dPicaCompositionDomain::Scene)
+                    draw.LightBinding = metadata->LightBinding;
                 if (mPacketSink != nullptr &&
                     !mPacketSink->SubmitDrawPacket(draw, error)) {
                     return false;

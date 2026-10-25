@@ -12,8 +12,28 @@ Forge currently provides the release-safe preparation and packaging boundary:
 - integrated bounds-checked extraction from decrypted `.3ds` and `.cci` NCSD
   cartridge images, including ExeFS `.code` decompression;
 - exact size and SHA-256 validation for the extracted code, ExHeader and RomFS;
-- automatic verified local import of TopScreen 2.1.1 HUD/menu textures, using
-  the official download or a local archive (see `TRIAEVUM_TOPSCREEN_INSTALLATION.md`);
+- installation of the SingleScreen 3.0 UI atlas and Link animations shipped in
+  the package, plus its HD graphics only from a local archive the user supplies
+  (see `TRIAEVUM_TOPSCREEN_INSTALLATION.md`);
+- optional third-party RomFS mods, off by default, obtained on the user's
+  request from the author's original archive and applied as a private local
+  overlay (see `TRIAEVUM_MOD_VANILLA_PLUS_LINK.md`);
+- a local water texture catalog (`cache/water/<key>/water_textures.txt`,
+  `--water-texture-catalog`): the renderer's content identities and roles
+  (surface, river, waterfall, underwater light) of the title's water
+  textures, read by name from the RomFS models, so the renderer recognises
+  water the title publishes no water body for (waterfalls, rapids, a moat);
+- a local scene light catalog (`cache/scene-lights/<key>/scene_lights.json`,
+  `--scene-light-catalog`): the light sources drawn into the rooms' meshes
+  (lava and fire surfaces, windows and lamps, light shafts, magic glows;
+  not torch stands, whose flames are actors the runtime lights while they
+  burn), found by texture name in the room CMBs, placed as point
+  lights with their textures' colour, per room file (standard and Master
+  Quest rooms by the fingerprint of their command list), so the Modern
+  renderer lights the architecture with them. Each light names the textures
+  of its surfaces and shines as strongly as the game draws them: a glow the
+  game fades by day (lit windows, distant lamps) is dark by day. Where a room
+  draws its lit windows as additive glow, the panes are glass, not lights;
 - a local file-identity hash cache so unchanged large inputs are not rehashed;
 - a deterministic content key and private `content.tap` index;
 - an explicit, content-addressed structural whole-AOT IR stage driven only by

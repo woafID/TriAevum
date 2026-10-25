@@ -2,7 +2,9 @@
 
 #include "oot3d_n64_integrated_ui_runtime.h"
 #include "oot3d_native_a32_memory.h"
+#include "oot3d_native_omote_ura_selector.h"
 #include "oot3d_top_screen_config.h"
+#include "oot3d_top_screen_dpad_picker.h"
 #include "oot3d_top_screen_items_hint.h"
 #include "oot3d_top_screen_mod_profile.h"
 #include "oot3d_top_screen_ocarina.h"
@@ -17,6 +19,8 @@
 #include <vector>
 
 namespace Oot3dNativeGame {
+
+class TopScreenWideItemsRuntime;
 
 inline constexpr std::size_t NativeUiSeamPhaseCount = 10U;
 inline constexpr std::uint32_t kTopScreenQuestMaterializedHook = 0x0042B884U;
@@ -46,6 +50,12 @@ struct NativeUiLifecycleBridgeStats {
   uint64_t topscreen_native_touch_visible_primitives = 0;
   uint64_t topscreen_horse_stamina_visible_frames = 0;
   uint64_t topscreen_horse_stamina_visible_primitives = 0;
+  // State captures that found the title's normal / Master Quest choice on
+  // the lower screen, and its last highlighted panel (-1 before any).
+  uint64_t version_choice_captures = 0;
+  int32_t version_choice_last_selection = -1;
+  // Reveals of the choice on one screen (START, A or touch on the title).
+  uint64_t version_choice_reveals = 0;
   std::array<uint64_t, oot3d::ui::kUiSubsystemCount> calls_by_subsystem{};
   std::array<uint64_t, NativeUiSeamPhaseCount> calls_by_phase{};
 };
@@ -72,6 +82,16 @@ public:
   NativeUiLifecycleObservation ObserveGuestEntry(uint32_t guestEntry);
   void ObserveGameplayComposition() noexcept;
   bool ApplyTopScreenGuestHook(uint32_t guestPc, uint32_t guestR0 = 0U);
+  bool AdvanceTopScreenViewIcon() {
+    return AdvanceTopScreenViewAlpha(mMemory, &mTopScreenViewAlpha);
+  }
+  bool BeginTopScreenTouchCopies() {
+    return BeginTopScreenTouchCopyUpdate(mMemory, &mTopScreenTouchCopies);
+  }
+  bool FinishTopScreenTouchCopies(bool retainPrevious) {
+    return FinishTopScreenTouchCopyUpdate(mMemory, retainPrevious,
+                                         &mTopScreenTouchCopies);
+  }
   std::vector<oot3d::ui::UiPrimitive>
   BuildShadowPresentation(oot3d::ui::UiSubsystem subsystem);
   std::vector<oot3d::ui::UiPrimitive>
@@ -80,9 +100,33 @@ public:
       std::optional<TopScreenPauseEdgeGeometry> geometry) noexcept;
   void SetTopScreenPausePageRedrawEdgePresentation(
       std::optional<TopScreenPauseEdgeGeometry> geometry) noexcept;
+  // SingleScreen 3.1 0x005D52E8 before the upper transfer of the Visions menu.
+  void SetTopScreenVisionsEdgePresentation(
+      std::optional<TopScreenPauseEdgeGeometry> geometry) noexcept {
+    mTopScreenVisionsEdgeGeometry = std::move(geometry);
+  }
+  // Retained across host refreshes, including the native tail's temporary
+  // System suppression. Updated before the first render-target bind.
+  void SetTopScreenSystemPagePresentation(bool active) noexcept {
+    mTopScreenSystemPagePresentation = active;
+  }
   void
   SetTopScreenInputFrame(const TopScreenExtendedInputFrame &input) noexcept;
   void SetTopScreenConfig(const TopScreenUiConfig &config) noexcept;
+  void SetTopScreenItemsShortcutSource(TopScreenWideItemsRuntime *source) noexcept {
+    mTopScreenItemsShortcuts = source;
+    mTopScreenDpadPickerCursor = {};
+    mTopScreenItemsShortcutCursor = {};
+  }
+  // Produced with BuildTopScreenPresentation(GameplayHud); consume in the same
+  // composition, using OcarinaPage alpha-only, post-filter TextureAlphaScale,
+  // and layer 37 before the layer-38 X/A glyph. Neither accessor advances time.
+  const TopScreenDpadPickerHoldCursor &TopScreenDpadPickerCursor() const noexcept {
+    return mTopScreenDpadPickerCursor;
+  }
+  const TopScreenDpadPickerHoldCursor &TopScreenItemsShortcutCursor() const noexcept {
+    return mTopScreenItemsShortcutCursor;
+  }
   bool ReadOcarinaGeometry(TopScreenOcarinaGeometry &geometry, std::string *error) {
     return ReadTopScreenOcarinaGeometry(mMemory, mTopScreenOcarina, &geometry, error);
   }
@@ -94,6 +138,20 @@ public:
   bool NativeGameplayPresentationActive() const noexcept;
   bool NativeFrontendPresentationActive() const noexcept;
   bool NativeTouchPresentationActive() const noexcept;
+  // The guest address of the version choice's own menu background
+  // (common_bg01) while the choice is presented.
+  std::optional<uint32_t> NativeVersionChoiceBackdropGuestAddress() const noexcept;
+  // One-screen profiles show the version choice only once the player reveals
+  // it (see ApplyTopScreenVersionChoiceReveal); the two-screen profile shows
+  // it as the game does. The reveal ends with the choice.
+  void SetVersionChoiceRevealRequired(bool required) noexcept {
+    mVersionChoiceRevealRequired = required;
+  }
+  bool NativeVersionChoiceAwaitingReveal() const noexcept;
+  // The title prompt before the panels enter: a press there reaches the game
+  // (which starts the panels) and also counts as the reveal.
+  bool NativeVersionChoicePrompting() const noexcept;
+  void RevealNativeVersionChoice() noexcept;
   std::optional<oot3d::ui::UiTextureIdentity> NativePauseSharedTextureIdentity(
       oot3d::ui::UiPauseSharedTextureSlot slot) const;
   std::optional<oot3d::ui::UiTextureIdentity>
@@ -121,15 +179,27 @@ private:
   uint64_t mCapturedGeneration = UINT64_MAX;
   oot3d::ui::Oot3dUiSemanticState mLatestState;
   bool mHasLatestState = false;
+  NativeOmoteUraSelectorState mOmoteUraSelector;
   std::array<bool, oot3d::ui::kUiSubsystemCount> mObservedSubsystems{};
   std::optional<oot3d::ui::UiSubsystem> mLastObservedSubsystem;
   TopScreenPauseProjectionState mTopScreenPauseProjection;
+  // Captured at the Quest draw, cleared at the next submit.
+  std::vector<TopScreenQuestCopiedQuad> mTopScreenQuestBCopies;
   std::optional<TopScreenPauseEdgeGeometry> mTopScreenPauseEdgeGeometry;
   std::optional<TopScreenPauseEdgeGeometry>
       mTopScreenPausePageRedrawEdgeGeometry;
+  std::optional<TopScreenPauseEdgeGeometry> mTopScreenVisionsEdgeGeometry;
+  bool mTopScreenSystemPagePresentation = false;
   TopScreenExtendedInputFrame mTopScreenInput;
   TopScreenOcarinaBrowser mTopScreenOcarina;
   TopScreenItemsHintRuntimeState mTopScreenItemsHint;
+  TopScreenWideItemsRuntime *mTopScreenItemsShortcuts = nullptr;
+  TopScreenDpadPickerHoldCursor mTopScreenDpadPickerCursor;
+  TopScreenDpadPickerHoldCursor mTopScreenItemsShortcutCursor;
+  TopScreenTouchCopyState mTopScreenTouchCopies;
+  float mTopScreenViewAlpha = 1.0F;
+  bool mVersionChoiceRevealRequired = false;
+  bool mVersionChoiceRevealed = false;
   TopScreenUiConfig mTopScreenConfig;
 };
 

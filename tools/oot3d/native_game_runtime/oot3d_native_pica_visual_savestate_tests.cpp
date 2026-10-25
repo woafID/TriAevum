@@ -32,6 +32,32 @@ int main() {
         0x0030F4D0U,
         1U,
     };
+    draw.Composition.NativeProjectedShadow = true;
+    draw.Composition.NativeActorGeometry = true;
+    draw.Composition.NativeActorIdentity = 0x1409001234ULL;
+    auto scenePoints = std::make_shared<Fast::Renderer3ds::PicaScenePointLights>();
+    scenePoints->Count = 2;
+    scenePoints->Lights[0] = {42, {3,5,7}, {1,.5F,.25F}, 0, 0};
+    scenePoints->Lights[1] = {43, {-3,6,8}, {.25F,.5F,1}, 80, 1};
+    draw.LightBinding.ScenePoints = scenePoints;
+    auto sceneDirectionals = std::make_shared<Fast::Renderer3ds::PicaSceneDirectionalLights>();
+    sceneDirectionals->Count = 2;
+    sceneDirectionals->Lights[0] = {51, {0,1,0}, {.6F,.4F,.2F}, true};
+    sceneDirectionals->Lights[1] = {52, {0,-1,0}, {.2F,.4F,.6F}, true};
+    sceneDirectionals->WorldUp = {0, 0, 1};
+    sceneDirectionals->ContinuityEpoch = 7;
+    sceneDirectionals->ShadowCasterIdentity = 51;
+    sceneDirectionals->ShadowStrength = 0.375F;
+    draw.LightBinding.SceneDirectionals = sceneDirectionals;
+    auto& pointLight = draw.LightBinding.Sources[2];
+    pointLight.Kind = Fast::Renderer3ds::PicaNativeLightSource::Type::Point;
+    pointLight.SourceIdentity = 42U;
+    pointLight.PositionWorld = {3.0F, 5.0F, 7.0F};
+    pointLight.UnattenuatedColor = {1.0F, 0.5F, 0.25F};
+    pointLight.ReferenceColor = {0.5F, 0.25F, 0.125F};
+    pointLight.Radius = 80.0F;
+    draw.LightBinding.WorldToView = std::array<float, 16>{
+        0,0,-1,0, 0,1,0,0, 1,0,0,0, -11,5,7,1};
     draw.VertexShader.StateKey = 11U;
     draw.VertexShader.Source = "vertex";
     draw.FragmentShader.StateKey = 13U;
@@ -71,6 +97,13 @@ int main() {
     draw.FragmentShader.Uniforms.ShadowOrthographic = 1;
     draw.FragmentShader.Uniforms.ShadowBiasConstant = 0.75F;
     draw.FragmentShader.Uniforms.ShadowBiasLinear = 0.125F;
+    draw.FragmentShader.Uniforms.TevProgram.Stages[5] = {0x000E000E, 0x1001, 0x40004, 0x20002};
+    draw.FragmentShader.Uniforms.TevProgram.Control[0] = 0xAB00;
+    draw.FragmentShader.Uniforms.LightingProgram.Control = {8,4,3,15};
+    draw.FragmentShader.Uniforms.LightingProgram.Luts[6] = {5,1,0.25F,1};
+    draw.FragmentShader.Uniforms.FragmentControl = {0x10005,0x31,0,0};
+    draw.FragmentShader.Uniforms.ProcTexProgram.Registers[1] = {1,2,3,4};
+    draw.FragmentShader.Uniforms.ProcTexProgram.Lut[223] = {0x12345678,0x87654321,0xFEDCBA98,0x89ABCDEF};
     auto lightingLuts = std::make_shared<Oot3dPicaLightingLutState>();
     lightingLuts->Entry(0U, 0U) = 0x00123ABCU;
     lightingLuts->Entry(23U, 255U) = 0x00FEDCBAU;
@@ -88,9 +121,11 @@ int main() {
     texture.State.MinMipLevel = 1U;
     texture.State.MaxMipLevel = 1U;
     texture.NativeBytes.resize(1280U, 0x5AU);
+    texture.CopyReferences = {
+        {24U, 21U, 0x20005000U, 768U},
+        {24U, 21U, 0x20005400U, 256U},
+    };
     Require(ResolveOot3dPicaTextureContentIdentity(texture, &error), error);
-    const uint64_t expectedBaseLevelContentHash =
-        texture.NativeBaseLevelContentHash;
     draw.Textures.push_back(std::move(texture));
     Oot3dPicaVisualFrame frame;
     frame.Sequence = 5U;
@@ -99,6 +134,10 @@ int main() {
     frame.TopTransfer.Transfer.OutputAddress = 0x20002000U;
     frame.Draws.push_back(draw);
     frame.StrictDrawIdentities.push_back(29U);
+    Oot3dPicaDisplayTransferSubmission rawCopy;
+    rawCopy.CompletionId = 24U;
+    rawCopy.Transfer = {0x20003000U, 0x20004000U, 0x3C0U, 0x4003C0U, 12U, 768000U};
+    frame.DisplayTransfers.push_back(rawCopy);
 
     Oot3dPicaVisualReplayState state;
     state.Scheduler.Accumulator.NextSequence = 6U;
@@ -117,7 +156,19 @@ int main() {
     Require(EncodeOot3dPicaVisualReplayState(state, encoded, &error), error);
     Oot3dPicaVisualReplayState decoded;
     Require(DecodeOot3dPicaVisualReplayState(encoded, decoded, &error), error);
+    Require(decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.TevProgram.Stages ==
+                draw.FragmentShader.Uniforms.TevProgram.Stages &&
+            decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.TevProgram.Control ==
+                draw.FragmentShader.Uniforms.TevProgram.Control, "TEV program lost in savestate round-trip");
+    Require(decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.LightingProgram ==
+                draw.FragmentShader.Uniforms.LightingProgram &&
+            decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.FragmentControl ==
+                draw.FragmentShader.Uniforms.FragmentControl, "lighting/fog/alpha program lost in savestate round-trip");
     Require(decoded.Scheduler.Accumulator.NextSequence == 6U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.ProcTexProgram.Registers ==
+                    draw.FragmentShader.Uniforms.ProcTexProgram.Registers &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].FragmentShader.Uniforms.ProcTexProgram.Lut ==
+                    draw.FragmentShader.Uniforms.ProcTexProgram.Lut &&
                 decoded.Scheduler.Accumulator.PendingDraws.size() == 1U &&
                 decoded.Scheduler.Accumulator.PendingDraws[0].SubmissionId ==
                     7U &&
@@ -140,12 +191,37 @@ int main() {
                         .Textures[0].State.LodBiasRaw == -256 &&
                 decoded.Scheduler.Accumulator.PendingDraws[0]
                         .Textures[0].ResolvedNativeBytes().size() == 1280U &&
+                !decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].NativeContentHashAvailable &&
+                !decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].NativeBaseLevelContentHashAvailable &&
                 decoded.Scheduler.Accumulator.PendingDraws[0]
-                        .Textures[0]
-                        .NativeBaseLevelContentHashAvailable &&
+                        .Textures[0].CopyReferences.size() == 2U &&
                 decoded.Scheduler.Accumulator.PendingDraws[0]
-                        .Textures[0].NativeBaseLevelContentHash ==
-                    expectedBaseLevelContentHash &&
+                        .Textures[0].CopyReferences[0].CompletionId == 24U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].CopyReferences[0]
+                        .AfterDrawSubmissionId == 21U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].CopyReferences[0].PhysicalAddress ==
+                    0x20005000U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].CopyReferences[0].ByteCount == 768U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].CopyReferences[1].PhysicalAddress ==
+                    0x20005400U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0]
+                        .Textures[0].CopyReferences[1].ByteCount == 256U &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.Sources == draw.LightBinding.Sources &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.WorldToView == draw.LightBinding.WorldToView &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].Composition.NativeProjectedShadow &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].Composition.NativeActorGeometry &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].Composition.NativeActorIdentity ==
+                    draw.Composition.NativeActorIdentity &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.ScenePoints &&
+                *decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.ScenePoints == *scenePoints &&
+                decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.SceneDirectionals &&
+                *decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.SceneDirectionals == *sceneDirectionals &&
                 decoded.Scheduler.Accumulator.PendingDraws[0]
                         .FragmentShader.Uniforms.TextureLodBias[2] == 1.25F &&
                 decoded.Scheduler.Accumulator.PendingDraws[0]
@@ -198,11 +274,52 @@ int main() {
                 decoded.LastSelectedTopTransferCompletionId == 23U &&
                 decoded.LastSubmittedDrawId == 7U,
             "visual replay state did not round-trip");
+    Require(decoded.LatestFrame->DisplayTransfers.size() == 1 &&
+                decoded.LatestFrame->DisplayTransfers[0].Transfer.TextureCopyBytes == 768000U &&
+                decoded.LatestFrame->DisplayTransfers[0].Transfer.OutputSize == 0x4003C0U,
+            "raw copy operation lost its fields on savestate round-trip");
+    {
+        // A raw copy still pending in the ordered replay state owes the guest
+        // one PPF completion. That obligation must survive save and restore and
+        // be discharged by the dependency boundary, never by host-local state
+        // (issue 49: the guest otherwise waits forever on a frozen frame).
+        Oot3dPicaVisualReplayState pending = state;
+        pending.Scheduler.Accumulator.PendingDisplayTransfers = {rawCopy};
+        std::vector<uint8_t> pendingEncoded;
+        Require(EncodeOot3dPicaVisualReplayState(pending, pendingEncoded, &error), error);
+        Oot3dPicaVisualReplayState pendingDecoded;
+        Require(DecodeOot3dPicaVisualReplayState(pendingEncoded, pendingDecoded, &error), error);
+        Require(pendingDecoded.Scheduler.Accumulator.PendingDisplayTransfers.size() == 1U,
+                "a pending raw copy was dropped by the savestate round-trip");
+        Oot3dPicaPresentationScheduler scheduler;
+        Require(scheduler.RestoreState(std::move(pendingDecoded.Scheduler)),
+                "the restored scheduler rejected a pending raw copy");
+        Require(scheduler.HasPendingRawCopyCompletion(),
+                "a restored pending raw copy stopped owing its guest completion");
+        Oot3dPicaVisualFrameViewSample dependencyWork;
+        Require(scheduler.ViewDependencyWork(dependencyWork) &&
+                    dependencyWork.DisplayTransfers.size() == 1U &&
+                    dependencyWork.DisplayTransfers[0].CompletionId == rawCopy.CompletionId &&
+                    dependencyWork.DisplayTransfers[0].SignalInterrupt &&
+                    dependencyWork.DisplayTransfers[0].Transfer.TextureCopyBytes ==
+                        rawCopy.Transfer.TextureCopyBytes,
+                "the restored dependency boundary lost its native copy");
+        Require(scheduler.HasPendingRawCopyCompletion(),
+                "viewing a dependency discharged an unexecuted guest completion");
+    }
     Require(decoded.Scheduler.Accumulator.PendingDraws[0].LightingLuts ==
                 decoded.PreviousFrame->Draws[0].LightingLuts &&
                 decoded.PreviousFrame->Draws[0].LightingLuts ==
                     decoded.LatestFrame->Draws[0].LightingLuts,
             "visual replay duplicated shared lighting LUT state");
+    const auto restoredPoints = decoded.PreviousFrame->Draws[0].LightBinding.ScenePoints;
+    Require(restoredPoints && restoredPoints == decoded.LatestFrame->Draws[0].LightBinding.ScenePoints &&
+                restoredPoints == decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.ScenePoints,
+            "restoring shared scene lighting duplicated its immutable native-frame snapshot");
+    const auto restoredDirectionals = decoded.PreviousFrame->Draws[0].LightBinding.SceneDirectionals;
+    Require(restoredDirectionals && restoredDirectionals == decoded.LatestFrame->Draws[0].LightBinding.SceneDirectionals &&
+                restoredDirectionals == decoded.Scheduler.Accumulator.PendingDraws[0].LightBinding.SceneDirectionals,
+            "restored native environment lost its shared geometry-synchronous snapshot");
     encoded.pop_back();
     Require(!DecodeOot3dPicaVisualReplayState(encoded, decoded, &error),
             "truncated visual replay state was accepted");

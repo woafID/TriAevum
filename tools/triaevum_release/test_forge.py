@@ -16,16 +16,20 @@ from common import load_json_object, atomic_write_json, sha256_file
 from migrate_installation import migrate_installation
 from installed_runtime import validate_installed_runtime
 from forge import (
+    TOPSCREEN_STANDARD_LAYOUT_FIELDS,
     ForgeError,
     HashCache,
     activate_prepared_title,
     build_private_aot_fallback,
+    check_title_path_length,
+    content_key,
     load_recipe,
     load_prepared_content,
     main as forge_main,
     package_private_module,
     prepare_content,
     prepare_private_aot_ir,
+    standard_topscreen_layout,
     verify_sources,
 )
 from tam_builder import (
@@ -161,6 +165,30 @@ class ForgeTests(unittest.TestCase):
         )
         self.assertFalse((directory / "game.tam").exists())
 
+    def test_title_folder_is_short_and_keeps_an_existing_full_key_folder(self) -> None:
+        # #103: the full 64-digit key put the module past Windows' path limit.
+        recipe, verified, verified_mod = self.verify()
+        key = content_key(recipe, verified)
+        result = prepare_content(recipe, verified, output_root=self.output, verified_mod=verified_mod,
+                                 process_manifest_builder=self.build_process_manifest)
+        self.assertEqual(Path(result["directory"]), (self.output / "fixture" / key[:16]).resolve())
+        self.assertEqual(load_json_object(Path(result["directory"]) / "forge-state.json")["content_key"], key)
+        # An installation made before keeps (and reuses) its full-key folder.
+        legacy = self.output / "fixture" / key
+        Path(result["directory"]).rename(legacy)
+        reused = prepare_content(recipe, verified, output_root=self.output, verified_mod=verified_mod,
+                                 process_manifest_builder=self.build_process_manifest)
+        self.assertEqual((reused["status"], Path(reused["directory"])), ("reused", legacy.resolve()))
+
+    def test_path_length_check_names_the_characters_to_remove(self) -> None:
+        base = Path("/x")
+        short = base / "TriAevum" / "data" / "titles"
+        check_title_path_length(short, ["oot3d-eur-project-baseline-16a6b0aa"], windows=True)
+        deep = base / ("d" * 150) / "data" / "titles"
+        with self.assertRaisesRegex(ForgeError, r"too long for Windows.*at least \d+ characters shorter"):
+            check_title_path_length(deep, ["oot3d-eur-project-baseline-16a6b0aa"], windows=True)
+        check_title_path_length(deep, ["oot3d-eur-project-baseline-16a6b0aa"], windows=False)
+
     def test_prepared_content_survives_installation_move(self) -> None:
         recipe, verified, verified_mod = self.verify()
         result = prepare_content(
@@ -218,7 +246,7 @@ class ForgeTests(unittest.TestCase):
                                      "sha256": sha256_file(manifest_path)}
         atomic_write_json(title / "content.tap", index)
         platform = host_platform()
-        exe, plugin = self.root / platform.runtime, self.root / platform.title_module
+        exe, plugin = self.root / platform.installed_runtime, self.root / platform.title_module
         exe.write_bytes(b"synthetic host")
         plugin.write_bytes(b"synthetic plugin")
         profile = self.root / "TriAevum.launch.json"
@@ -254,7 +282,7 @@ class ForgeTests(unittest.TestCase):
             shutil.copytree(self.root, moved)
             new_title = moved / title.relative_to(self.root)
             runtime = load_json_object(new_title / "forge-state.json")["runtime"]
-            validate_installed_runtime(moved / host_platform().runtime, new_title, moved / "forge-output", runtime)
+            validate_installed_runtime(moved / host_platform().installed_runtime, new_title, moved / "forge-output", runtime)
             self.assertEqual((moved / save.relative_to(self.root)).read_bytes(), save_before)
 
     def test_migration_rolls_back_every_metadata_file_on_late_failure(self):
@@ -285,10 +313,10 @@ class ForgeTests(unittest.TestCase):
             shutil.copytree(self.root, moved)
             new_title = moved / title.relative_to(self.root)
             runtime = load_json_object(new_title / "forge-state.json")["runtime"]
-            validate_installed_runtime(moved / host_platform().runtime, new_title, moved / "forge-output", runtime)
+            validate_installed_runtime(moved / host_platform().installed_runtime, new_title, moved / "forge-output", runtime)
             (moved / pack.relative_to(self.root)).write_bytes(b"corrupted")
             with self.assertRaisesRegex(ValueError, "PICA shader pack changed"):
-                validate_installed_runtime(moved / host_platform().runtime, new_title, moved / "forge-output", runtime)
+                validate_installed_runtime(moved / host_platform().installed_runtime, new_title, moved / "forge-output", runtime)
 
     def test_mutable_shader_cache_moves_with_install_and_is_not_a_required_artifact(self):
         title, save = self.prepare_legacy_installation()
@@ -311,7 +339,7 @@ class ForgeTests(unittest.TestCase):
             runtime = load_json_object(new_title / "forge-state.json")["runtime"]
             new_cache = moved / cache.relative_to(self.root)
             for _ in range(2):
-                validate_installed_runtime(moved / host_platform().runtime, new_title, moved / "forge-output", runtime)
+                validate_installed_runtime(moved / host_platform().installed_runtime, new_title, moved / "forge-output", runtime)
                 if new_cache.exists(): shutil.rmtree(new_cache)
             new_profile = moved / profile.relative_to(self.root)
             payload = load_json_object(new_profile)
@@ -319,7 +347,7 @@ class ForgeTests(unittest.TestCase):
             atomic_write_json(new_profile, payload)
             runtime["launch_profile_sha256"] = sha256_file(new_profile)
             with self.assertRaisesRegex(ValueError, "cache routing"):
-                validate_installed_runtime(moved / host_platform().runtime, new_title, moved / "forge-output", runtime)
+                validate_installed_runtime(moved / host_platform().installed_runtime, new_title, moved / "forge-output", runtime)
 
     def test_reuses_identical_content_addressed_output(self) -> None:
         recipe, verified, verified_mod = self.verify()
@@ -622,6 +650,32 @@ class ForgeTests(unittest.TestCase):
                 target_triple="x86_64-pc-windows-msvc",
                 translator_identity="7" * 64,
             )
+
+
+class StandardTopScreenLayoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.standard = load_json_object(Path(__file__).resolve().parents[2] / "config/topscreen_ui.example.json")
+
+    def test_layout_follows_the_standard_profile_and_keeps_user_choices(self) -> None:
+        user = dict(self.standard, hud_margin_x=8, magic_bar_y=0, dpad_offset_y=4, render_items_hint=False,
+                    hud_scale=1.0, roll_dash=False, free_camera_enabled=True, dpad_child=["view"] * 4)
+        migrated = standard_topscreen_layout(user, self.standard)
+        for field in TOPSCREEN_STANDARD_LAYOUT_FIELDS:
+            self.assertEqual(migrated[field], self.standard[field])
+        self.assertEqual(migrated["hud_scale"], 1.0)
+        self.assertFalse(migrated["roll_dash"])
+        self.assertTrue(migrated["free_camera_enabled"])
+        self.assertEqual(migrated["dpad_child"], ["view"] * 4)
+        self.assertEqual(standard_topscreen_layout(migrated, self.standard), migrated)
+
+    def test_a_size_outside_the_menu_becomes_the_standard_size(self) -> None:
+        for scale in (0.8, 0.75, "large"):
+            migrated = standard_topscreen_layout(dict(self.standard, hud_scale=scale), self.standard)
+            self.assertEqual(migrated["hud_scale"], 0.7)
+
+    def test_other_schemas_are_left_to_the_runtime(self) -> None:
+        legacy = {"schema": "oot3d_topscreen_ui_v1", "hud_scale": 0.8}
+        self.assertIs(standard_topscreen_layout(legacy, self.standard), legacy)
 
 
 if __name__ == "__main__":

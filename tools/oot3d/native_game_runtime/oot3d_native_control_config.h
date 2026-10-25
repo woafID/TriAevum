@@ -75,10 +75,14 @@ struct NativeControlConfig {
   float RightStickAimMaximumDegreesPerSecond = 180.0F;
   float ControllerGyroscopeSensitivity = 1.0F;
   float ControllerAccelerometerSensitivity = 1.0F;
-  float FreeCameraMotionSensitivity = 1.0F;
   bool NativeAimInvertX = false;
   bool NativeAimInvertY = false;
   std::string PreferredControllerGuid;
+  std::string PreferredControllerSerial;
+  bool ControllerTouchpadEnabled = true;
+  std::int32_t ControllerTouchpadIndex = 0;
+  std::string CalibrationControllerGuid;
+  std::string CalibrationControllerSerial;
   std::array<float, 3> GyroscopeBiasDegreesPerSecond{};
   std::array<float, 3> AccelerometerNeutral{0.0F, -1.0F, 0.0F};
 
@@ -130,11 +134,16 @@ using NativeControlDeviceDescriptor =
 using NativeControlMotionObservation =
     ThreeDsRecomp::Input::MotionObservation;
 
+NativeControlConfig ControlsForDevice(const NativeControlConfig& config,
+    const NativeControlDeviceDescriptor* device);
+
 struct NativeControlCalibrationStatus {
   bool Active = false;
   std::uint32_t SamplesCollected = 0;
   std::uint32_t SamplesRequired = 60;
   bool LastCalibrationSucceeded = false;
+  bool WaitingForStillness = false;
+  std::string Error;
 };
 
 struct NativeControlConfigSnapshot {
@@ -164,6 +173,7 @@ class NativeControlConfigRuntime final {
   void CancelMotionCalibration() noexcept;
   bool ResetMotionCalibration(std::string* error = nullptr);
   [[nodiscard]] NativeControlCalibrationStatus CalibrationStatus() const;
+  [[nodiscard]] NativeControlMotionObservation MotionStatus() const;
 
   void BeginBindingCapture(ThreeDsRecomp::Input::BindingDevice device);
   void CancelBindingCapture();
@@ -178,10 +188,8 @@ class NativeControlConfigRuntime final {
   std::vector<NativeControlDeviceDescriptor> mDevices;
   NativeControlCalibrationStatus mCalibration;
   ThreeDsRecomp::Input::HostBindingCapture mBindingCapture;
-  std::array<double, 3> mCalibrationGyroscopeSum{};
-  std::array<double, 3> mCalibrationAccelerometerSum{};
-  std::uint32_t mCalibrationGyroscopeSamples = 0;
-  std::uint32_t mCalibrationAccelerometerSamples = 0;
+  ThreeDsRecomp::Input::MotionCalibrationAccumulator mCalibrationSamples;
+  NativeControlMotionObservation mLastMotion;
 };
 
 } // namespace Oot3dNativeGame

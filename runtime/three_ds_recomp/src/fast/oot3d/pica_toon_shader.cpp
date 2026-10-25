@@ -1,5 +1,6 @@
 #include "fast/oot3d/pica_toon_shader.h"
 #include "fast/oot3d/toon_surface_response.h"
+#include "fast/oot3d/pica_toon_fragment_artifact.h"
 
 #include <algorithm>
 #include <bit>
@@ -62,19 +63,7 @@ std::string Float(float value) {
     return out.str();
 }
 
-std::string Declarations(const ToonStyleSettings& style, bool usesVertexLighting) {
-    const auto params = PackToonSurfaceParameters(ToonMode::PicaMaterial, style, usesVertexLighting);
-    const auto vec4 = [](const std::array<float, 4>& value) {
-        return "vec4(" + Float(value[0]) + ", " + Float(value[1]) + ", " +
-            Float(value[2]) + ", " + Float(value[3]) + ")";
-    };
-    std::string source(kToonSurfaceResponseShader);
-    source += "\nToonSurfaceParameters oot3d_toon_parameters() {\n"
-        "    return ToonSurfaceParameters(" + vec4(params.Control) + ", " +
-        vec4(params.Shadow) + ", " + vec4(params.Rim) + ", " + vec4(params.Flags) +
-        ", vec4[2](" + vec4(params.Levels[0]) + ", " + vec4(params.Levels[1]) +
-        "), vec4[2](" + vec4(params.Thresholds[0]) + ", " + vec4(params.Thresholds[1]) + "));\n}\n";
-    source += R"glsl(
+constexpr std::string_view kToonHelpers = R"glsl(
 vec3 oot3d_toon_rotate_z(vec4 q) {
     float qlen = dot(q, q);
     if (qlen < 0.000001) return vec3(0.0, 0.0, 1.0);
@@ -95,9 +84,49 @@ vec3 oot3d_material_rim(vec3 materialNormal) {
     return oot3d_toon_rim(materialNormal, pica_view, oot3d_toon_parameters());
 }
 )glsl";
+
+std::string Declarations(const ToonStyleSettings& style, bool usesVertexLighting,
+                         bool uniformParameters = false, bool drawControl = false) {
+    std::string source(kToonSurfaceResponseShader);
+    if (uniformParameters) {
+        // The draw's decisions follow the parameters (PicaUberEffectBlock).
+        source += "\nlayout(set=0,binding=15,std140) uniform Oot3dToonSurface {\n"
+                  "    ToonSurfaceParameters parameters;\n" +
+                  std::string(drawControl ? "    uvec4 control;\n" : "") + "} oot3d_toon_uniforms;\n"
+                  "ToonSurfaceParameters oot3d_toon_parameters() {\n"
+                  "    ToonSurfaceParameters p = oot3d_toon_uniforms.parameters;\n"
+                  "    p.flags.y = " + std::string(usesVertexLighting ? "1.0" : "0.0") +
+                  ";\n    return p;\n}\n";
+    } else {
+        const auto params = PackToonSurfaceParameters(ToonMode::PicaMaterial, style, usesVertexLighting);
+        const auto vec4 = [](const std::array<float, 4>& value) {
+            return "vec4(" + Float(value[0]) + ", " + Float(value[1]) + ", " +
+                Float(value[2]) + ", " + Float(value[3]) + ")";
+        };
+        source += "\nToonSurfaceParameters oot3d_toon_parameters() {\n"
+            "    return ToonSurfaceParameters(" + vec4(params.Control) + ", " +
+            vec4(params.Shadow) + ", " + vec4(params.Rim) + ", " + vec4(params.Flags) +
+            ", vec4[2](" + vec4(params.Levels[0]) + ", " + vec4(params.Levels[1]) +
+            "), vec4[2](" + vec4(params.Thresholds[0]) + ", " + vec4(params.Thresholds[1]) + "));\n}\n";
+    }
+    source += kToonHelpers;
     return source;
 }
+
 } // namespace
+
+std::string PicaToonUberDeclarations(std::string_view parametersBlock, std::string_view vertexLighting) {
+    std::string source(kToonSurfaceResponseShader);
+    source += parametersBlock;
+    source += "ToonSurfaceParameters oot3d_toon_parameters() {\n"
+              "    ToonSurfaceParameters p = oot3d_uber.toon;\n"
+              "    p.flags.y = ";
+    source += vertexLighting;
+    source += ";\n    return p;\n}\n";
+    source += kToonHelpers;
+    return source;
+}
+
 
 PicaToonEligibility ClassifyPicaToonDraw(const PicaToonDrawInfo& draw,
                                          ToonMode mode) {
@@ -167,7 +196,8 @@ PicaToonShaderVariant BuildPicaToonShaderVariant(
 PicaToonInstrumentation BuildPicaToonInstrumentation(
     uint64_t originalFragmentKey, const PicaToonDrawInfo& draw,
     ToonMode mode, const ToonStyleSettings& style,
-    const ::Oot3d::Renderer::PicaShaderHookLayout& hooks) {
+    const ::Oot3d::Renderer::PicaShaderHookLayout& hooks,
+    bool uniformParameters, bool drawControl) {
     using ::Oot3d::Renderer::PicaShaderHook;
     using ::Oot3d::Renderer::PicaShaderSemantic;
 
@@ -202,7 +232,7 @@ PicaToonInstrumentation BuildPicaToonInstrumentation(
                                ? PicaShaderHook::PicaLighting
                                : PicaShaderHook::BeforeDepth;
     result.Declarations = Declarations(
-        style, hooks.Has(PicaShaderSemantic::PrimaryColorConsumed));
+        style, hooks.Has(PicaShaderSemantic::PrimaryColorConsumed), uniformParameters, drawControl);
     if (materialPath) {
         result.Body =
             "\n    primary_fragment_color.rgb = "
@@ -215,7 +245,9 @@ PicaToonInstrumentation BuildPicaToonInstrumentation(
             "    combiner_output.rgb = "
             "oot3d_apply_toon(combiner_output.rgb);\n";
     }
-    result.FragmentKey = VariantKey(originalFragmentKey, mode, style);
+    result.FragmentKey = uniformParameters
+        ? AppendHash(VariantKey(originalFragmentKey, mode, ToonStyleSettings{}), 15U)
+        : VariantKey(originalFragmentKey, mode, style);
     return result;
 }
 

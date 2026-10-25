@@ -34,7 +34,6 @@
 #include "ship/utils/Utils.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
-#include "three_ds_recomp/oot3d/Oot3dNativeRenderCommand.h"
 
 #include "three_ds_recomp/legacy/libultra/os.h"
 
@@ -139,22 +138,6 @@ void Interpreter::Flush() {
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
-}
-
-void Interpreter::RestoreRenderingStateAfterExternalDraw() {
-    mRapi->SetNativeCullMode(GfxNativeCullMode::KeepAll);
-    mRapi->SetDepthTestAndMask((mRenderingState.depth_test_and_mask & 1) != 0,
-                              (mRenderingState.depth_test_and_mask & 2) != 0);
-    mRapi->SetZmodeDecal(mRenderingState.decal_mode);
-    mRapi->SetUseAlpha(mRenderingState.alpha_blend);
-    mRapi->SetViewport(mRenderingState.viewport.x, mRenderingState.viewport.y,
-                       mRenderingState.viewport.width, mRenderingState.viewport.height);
-    mRapi->SetScissor(mRenderingState.scissor.x, mRenderingState.scissor.y,
-                      mRenderingState.scissor.width, mRenderingState.scissor.height);
-    if (mRenderingState.mShaderProgram != nullptr) {
-        mRapi->LoadShader(mRenderingState.mShaderProgram);
-    }
-    std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
@@ -4331,27 +4314,6 @@ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
-bool gfx_oot3d_native_render_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
-    F3DGfx* cmd = *cmd0;
-    ThreeDsRecomp::Oot3d::Matrix4f worldToClip{};
-    ThreeDsRecomp::Oot3d::Matrix4f viewToClip{};
-
-    gfx->Flush();
-    for (size_t row = 0; row < 4; ++row) {
-        for (size_t column = 0; column < 4; ++column) {
-            // Fast3D transforms row vectors; the native renderer transforms column vectors.
-            worldToClip.M[row][column] = gfx->mRsp->MP_matrix[column][row];
-            viewToClip.M[row][column] = gfx->mRsp->P_matrix[column][row];
-        }
-    }
-
-    ThreeDsRecomp::Oot3d::ExecuteNativeRenderScene(static_cast<ThreeDsRecomp::Oot3d::NativeRenderCommandToken>(cmd->words.w1),
-                                          *gfx->GetCurrentRenderingAPI(), worldToClip, viewToClip);
-    gfx->RestoreRenderingStateAfterExternalDraw();
-    return false;
-}
-
 bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4626,8 +4588,6 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_REGBLENDEDTEX,
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
-    { OTR_G_OOT3D_NATIVE_RENDER,
-      { "G_OOT3D_NATIVE_RENDER", gfx_oot3d_native_render_handler_custom } }, // G_OOT3D_NATIVE_RENDER (0x41)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
@@ -5301,91 +5261,8 @@ void Interpreter::GetCurDimensions(uint32_t* width, uint32_t* height) {
 
 } // namespace Fast
 
-void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeatures* cc_features) {
-    for (int i = 0; i < 2; i++) {
-        for (int j = 0; j < 2; j++) {
-            for (int k = 0; k < 4; k++) {
-                cc_features->c[i][j][k] = shader_id0 >> i * 32 + j * 16 + k * 4 & 0xf;
-            }
-        }
-    }
-
-    cc_features->opt_alpha = (shader_id1 & SHADER_OPT(ALPHA)) != 0;
-    cc_features->opt_fog = (shader_id1 & SHADER_OPT(FOG)) != 0;
-    cc_features->opt_texture_edge = (shader_id1 & SHADER_OPT(TEXTURE_EDGE)) != 0;
-    cc_features->opt_noise = (shader_id1 & SHADER_OPT(NOISE)) != 0;
-    cc_features->opt_2cyc = (shader_id1 & SHADER_OPT(_2CYC)) != 0;
-    cc_features->opt_alpha_threshold = (shader_id1 & SHADER_OPT(ALPHA_THRESHOLD)) != 0;
-    cc_features->opt_invisible = (shader_id1 & SHADER_OPT(INVISIBLE)) != 0;
-    cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
-    cc_features->opt_prim_depth = (shader_id1 & SHADER_OPT(PRIM_DEPTH)) != 0;
-
-    cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
-    cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
-    cc_features->clamp[1][0] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_S);
-    cc_features->clamp[1][1] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_T);
-
-    cc_features->usedTextures[0] = false;
-    cc_features->usedTextures[1] = false;
-    cc_features->used_masks[0] = false;
-    cc_features->used_masks[1] = false;
-    cc_features->used_blend[0] = false;
-    cc_features->used_blend[1] = false;
-    cc_features->numInputs = 0;
-
-    for (int c = 0; c < 2; c++) {
-        for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < 4; j++) {
-                if (cc_features->c[c][i][j] >= SHADER_INPUT_1 && cc_features->c[c][i][j] <= SHADER_INPUT_7) {
-                    if (cc_features->c[c][i][j] > cc_features->numInputs) {
-                        cc_features->numInputs = cc_features->c[c][i][j];
-                    }
-                }
-                if (cc_features->c[c][i][j] == SHADER_TEXEL0 || cc_features->c[c][i][j] == SHADER_TEXEL0A) {
-                    cc_features->usedTextures[0] = true;
-                    if (cc_features->opt_2cyc) {
-                        cc_features->usedTextures[1] = true;
-                    }
-                }
-                if (cc_features->c[c][i][j] == SHADER_TEXEL1 || cc_features->c[c][i][j] == SHADER_TEXEL1A) {
-                    cc_features->usedTextures[1] = true;
-                    if (cc_features->opt_2cyc) {
-                        cc_features->usedTextures[0] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    for (int c = 0; c < 2; c++) {
-        cc_features->do_single[c][0] = cc_features->c[c][0][2] == SHADER_0;
-        cc_features->do_single[c][1] = cc_features->c[c][1][2] == SHADER_0;
-        cc_features->do_multiply[c][0] = cc_features->c[c][0][1] == SHADER_0 && cc_features->c[c][0][3] == SHADER_0;
-        cc_features->do_multiply[c][1] = cc_features->c[c][1][1] == SHADER_0 && cc_features->c[c][1][3] == SHADER_0;
-        cc_features->do_mix[c][0] = cc_features->c[c][0][1] == cc_features->c[c][0][3];
-        cc_features->do_mix[c][1] = cc_features->c[c][1][1] == cc_features->c[c][1][3];
-        cc_features->color_alpha_same[c] = (shader_id0 >> c * 32 & 0xffff) == (shader_id0 >> c * 32 + 16 & 0xffff);
-    }
-
-    if (cc_features->usedTextures[0] && shader_id1 & SHADER_OPT(TEXEL0_MASK)) {
-        cc_features->used_masks[0] = true;
-    }
-    if (cc_features->usedTextures[1] && shader_id1 & SHADER_OPT(TEXEL1_MASK)) {
-        cc_features->used_masks[1] = true;
-    }
-
-    if (cc_features->usedTextures[0] && shader_id1 & SHADER_OPT(TEXEL0_BLEND)) {
-        cc_features->used_blend[0] = true;
-    }
-    if (cc_features->usedTextures[1] && shader_id1 & SHADER_OPT(TEXEL1_BLEND)) {
-        cc_features->used_blend[1] = true;
-    }
-
-    cc_features->shader_id = Fast::ShaderIdUnmask(shader_id1);
-    if (cc_features->shader_id == Fast::SHADER_ID_PICA_TEXTURE2_MULT_ADD) {
-        cc_features->usedTextures[0] = true;
-        cc_features->usedTextures[1] = true;
-    }
+void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, CCFeatures* features) {
+    DecodeCompatibilityCombiner(shader_id0, shader_id1, features);
 }
 
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,

@@ -49,8 +49,12 @@ def atomic_write_json(path: Path, value: object) -> None:
 
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the temporary name shorter than the destination. Content-addressed
+    # destinations already sit close to the legacy Win32 path limit inside a
+    # deep installation root, where a longer temporary name turns a legal write
+    # into a misleading "No such file or directory" failure (issue 53).
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=".", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
     try:
@@ -62,3 +66,20 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+# The package's release manifest: in docs/ in the Windows package (its root
+# holds only TriAevumForge.exe, README.md and LICENSE), in the root elsewhere.
+RELEASE_MANIFEST_PATHS = ("release-manifest.json", "docs/release-manifest.json")
+
+
+def release_manifest_relative(target: str) -> str:
+    return RELEASE_MANIFEST_PATHS[1] if target == "x86_64-pc-windows-msvc" else RELEASE_MANIFEST_PATHS[0]
+
+
+def release_manifest_path(package: Path) -> Path:
+    for relative in RELEASE_MANIFEST_PATHS:
+        candidate = package / relative
+        if candidate.is_file():
+            return candidate
+    return package / RELEASE_MANIFEST_PATHS[0]
